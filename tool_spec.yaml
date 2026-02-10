@@ -1,0 +1,145 @@
+name: busy38-discord
+version: "0.1.0"
+license: GPL-3.0-only
+kind: busy38-vendor-toolkit
+
+summary: >
+  Discord vendor plugin for Busy38 that exposes agent-internal cheatcodes for
+  Discord transcript search and forum/thread operations.
+
+namespaces:
+  dlog:
+    description: Discord transcript tools backed by Busy38 DuckDB chat logs.
+    actions:
+      search:
+        description: Broad search returning snippet windows around matches (recency-biased by default).
+        parameters:
+          query:
+            type: string
+            required: true
+            description: Query string (literal unless regex=true)
+          project_id:
+            type: string
+            required: false
+            description: Project/channel id in Busy38 chat logs (e.g. "discord:<guild_id>:<channel_id>")
+          max_age_hours:
+            type: integer
+            required: false
+            default: 24
+            description: Only include messages newer than this age (0 disables)
+          max_messages:
+            type: integer
+            required: false
+            default: 5000
+            description: Max rows scanned from chat_entries (newest-first)
+          context:
+            type: integer
+            required: false
+            default: 80
+            description: Snippet context window size in characters
+          case_sensitive:
+            type: boolean
+            required: false
+            default: false
+          regex:
+            type: boolean
+            required: false
+            default: false
+          snippets_per_message:
+            type: integer
+            required: false
+            default: 2
+          max_results:
+            type: integer
+            required: false
+            default: 20
+        returns:
+          type: object
+          properties:
+            success: { type: boolean }
+            results:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string, description: 'chat_entries.id like "discord:<message_id>"' }
+                  timestamp: { type: string }
+                  project_id: { type: string }
+                  snippets: { type: array, items: { type: string } }
+                  metadata: { type: object }
+      around:
+        description: Drill-down context around a specific transcript message.
+        parameters:
+          message_id:
+            type: string
+            required: true
+            description: Discord message id (numeric) or "discord:<id>"
+          before:
+            type: integer
+            required: false
+            default: 8
+            description: Number of messages before
+          after:
+            type: integer
+            required: false
+            default: 8
+            description: Number of messages after
+        returns:
+          type: object
+          properties:
+            success: { type: boolean }
+            rows:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  timestamp: { type: string }
+                  project_id: { type: string }
+                  content: { type: string }
+                  metadata: { type: object }
+
+  dforum:
+    description: Async operations for Discord forum channels and their threads (task-board support).
+    actions:
+      reply:
+        description: Post a message to an existing thread.
+        parameters:
+          thread_id: { type: integer, required: true }
+          content: { type: string, required: true }
+      rename:
+        description: Rename a thread.
+        parameters:
+          thread_id: { type: integer, required: true }
+          name: { type: string, required: true }
+      set_tags:
+        description: Apply forum tags to a thread by tag names.
+        parameters:
+          thread_id: { type: integer, required: true }
+          tag_names:
+            type: string
+            required: true
+            description: Comma-separated tag names (must exist on the forum)
+      archive:
+        description: Archive or unarchive a thread.
+        parameters:
+          thread_id: { type: integer, required: true }
+          archived: { type: boolean, required: false, default: true }
+      lock:
+        description: Lock or unlock a thread.
+        parameters:
+          thread_id: { type: integer, required: true }
+          locked: { type: boolean, required: false, default: true }
+      create_post:
+        description: Create a new forum post (thread) in a forum channel.
+        parameters:
+          forum_id: { type: integer, required: true }
+          title: { type: string, required: true }
+          content: { type: string, required: true }
+          tag_names: { type: string, required: false, default: "" }
+      get_thread:
+        description: Fetch recent thread messages plus applied tags.
+        parameters:
+          thread_id: { type: integer, required: true }
+          limit: { type: integer, required: false, default: 30 }
+
