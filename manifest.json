@@ -1,0 +1,11 @@
+{
+  "name": "busy-38-discord",
+  "version": "0.1.0",
+  "description": "Busy38 Discord integration toolkit (agent-internal Discord transcript search tools).",
+  "license": "GPL-3.0-only",
+  "type": "toolkit",
+  "permissions": [
+    "read:busy38_chat_logs"
+  ],
+  "toolkit_path": "toolkit"
+}
