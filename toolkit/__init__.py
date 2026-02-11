@@ -15,8 +15,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
 from core.cheatcodes.registry import register_namespace
-from integrations.discord_transcript import DiscordTranscriptLogger
-from integrations.discord_runtime import get_bot
+from .discord_transcript import DiscordTranscriptLogger
+from .discord_runtime import get_bot
 
 
 @dataclass

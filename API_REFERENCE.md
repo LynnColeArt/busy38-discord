@@ -1,6 +1,29 @@
 # busy38-discord API Reference
 
-This plugin exposes agent-facing capabilities via Busy38 cheatcodes.
+This plugin exposes Busy38 Discord runtime behavior plus agent-facing cheatcodes.
+
+## Runtime: `Busy38DiscordBot`
+
+Implementation path: `toolkit/discord_bot.py`
+
+Key behavior:
+- Ingests all channel traffic and decides when to respond.
+- Supports subscribe/follow controls and forum task-board subscriptions.
+- Applies 24h recency bias by default for context/search.
+- Supports silent acknowledgements:
+  - `[no-response /]`
+  - optional `[react:EMOJI]`
+- Uses anti-spam guardrails for follow-mode in high-traffic channels.
+- Adds assignment/handoff coordination hints for multi-agent channels.
+
+Core env controls:
+- `DISCORD_CONTEXT_MAX_AGE_SEC` (default `86400`)
+- `DISCORD_NO_RESPONSE_REACTIONS` (default `1`)
+- `DISCORD_NO_RESPONSE_REACTIONS_ON_BOTS` (default `1`)
+- `DISCORD_NO_RESPONSE_EMOJIS` (default `👍,👀,✅`)
+- `DISCORD_FOLLOW_SPAM_WINDOW_SEC` (default `30`)
+- `DISCORD_FOLLOW_SPAM_MAX_EVENTS` (default `12`)
+- `DISCORD_FOLLOW_SPAM_COOLDOWN_SEC` (default `45`)
 
 ## Namespace: `dlog`
 
@@ -108,4 +131,3 @@ Fetch recent messages and applied tags:
 
 - `dlog:*` reads local chat logs only; it does not fetch from Discord.
 - `dforum:*` uses Discord APIs and should be treated as a privileged capability.
-
