@@ -12,7 +12,7 @@ This plugin is intended to be **vendored into Busy38** under `./vendor/busy-38-d
 ### Runtime
 
 - `Busy38DiscordBot` now lives in this plugin (`toolkit/discord_bot.py`).
-- Busy core keeps thin compatibility shims under `integrations/discord_*.py`.
+- Busy core imports this runtime directly from `vendor/busy-38-discord/toolkit`.
 - The bot supports:
   - full-channel ingestion + follow mode
   - forum task-board subscriptions
