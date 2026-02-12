@@ -15,12 +15,16 @@ This plugin is intended to be **vendored into Busy38** under `./vendor/busy-38-d
 - Busy core imports this runtime directly from `vendor/busy-38-discord/toolkit`.
 - The bot supports:
   - full-channel ingestion + follow mode
+  - attachment-aware ingestion (metadata + optional text previews)
   - forum task-board subscriptions
   - recency-biased context (24h default)
+  - attachment directives in agent replies (`[attach ... /]`, including base64/data URI payloads)
   - no-response reaction acknowledgements (emoji palette + optional agent directive)
   - anti-spam follow guardrails for high-traffic channels
   - assignment/handoff-aware multi-agent coordination hints
   - hardware-auth enforcement hooks
+  - moderated `!busy38 clear [hours]` summary+pin context reset flow
+  - optional heartbeat-driven auto-clear job registration via hooks
 
 ### Agent Cheatcodes
 
@@ -28,6 +32,7 @@ The plugin registers these cheatcode namespaces in Busy38’s cheatcode registry
 
 - `dlog:*`: search Busy38’s Discord transcript DB (broad search with snippets, then drill-down context)
 - `dforum:*`: async operations for forum threads (reply, rename, tag, archive/lock, create posts)
+  - `reply` and `create_post` support attachments from local paths, URLs, base64 payloads, or data URIs
 
 See `API_REFERENCE.md` and `tool_spec.yaml`.
 
@@ -54,6 +59,19 @@ See `API_REFERENCE.md` and `tool_spec.yaml`.
 - `DISCORD_FOLLOW_SPAM_WINDOW_SEC`: follow-mode guardrail window seconds (default `30`)
 - `DISCORD_FOLLOW_SPAM_MAX_EVENTS`: max follow triggers in window before cooldown (default `12`)
 - `DISCORD_FOLLOW_SPAM_COOLDOWN_SEC`: cooldown after burst limit is exceeded (default `45`)
+- `DISCORD_CLEAR_WINDOW_HOURS`: summary window for `!busy38 clear` and auto-clear (default `72`)
+- `DISCORD_CLEAR_MAX_MESSAGES`: transcript message cap for summary generation (default `1200`)
+- `DISCORD_AUTO_CLEAR_ENABLE`: register heartbeat auto-clear job when `1` (default `0`)
+- `DISCORD_AUTO_CLEAR_INTERVAL_SEC`: heartbeat job interval for auto-clear checks (default `900`)
+- `DISCORD_AUTO_CLEAR_MIN_GAP_SEC`: per-channel minimum time between clear operations (default `21600`)
+- `DISCORD_CLEAR_STATE_PATH`: local file for per-channel clear timestamps (default `./data/discord_clear_state.json`)
+- `DISCORD_AGENT_ATTACHMENTS_ENABLE`: parse/send `[attach ... /]` directives from agent output (default `1`)
+- `DISCORD_ATTACHMENT_MAX_BYTES`: max file size per outbound attachment in bytes (default `8000000`)
+- `DISCORD_ATTACHMENT_MAX_FILES`: max attachments per outbound message (default `10`)
+- `DISCORD_ATTACHMENT_INCLUDE_URLS`: append attachment URLs into ingested content lines (default `1`)
+- `DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE`: attempt text previews for small text-like files (default `1`)
+- `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES`: max inbound file size for preview extraction (default `65536`)
+- `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS`: max preview characters saved per attachment (default `1200`)
 
 ## Licensing
 

@@ -12,6 +12,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -37,12 +38,19 @@ from .discord_state import (
     save_subscriptions_to_keystore,
 )
 from .discord_transcript import DiscordTranscriptLogger
+from .discord_attachments import (
+    attachment_summary_line,
+    build_discord_files,
+    close_discord_files,
+    extract_message_attachments,
+    parse_attach_directives,
+)
 
 # Hardware-bound authorization gate
 from core.security.hardware_auth import require_hardware_auth, hardware_auth_is_configured, HardwareAuthError
 
 # Runtime bridge for vendor discord tools (dforum)
-from .discord_runtime import set_bot as _set_discord_runtime_bot
+from .discord_runtime import set_bot as _set_discord_runtime_bot, set_controller as _set_discord_runtime_controller
 
 # SquidKeys integration
 try:
@@ -165,12 +173,33 @@ class Busy38DiscordBot:
 
         # Expose bot instance for vendor async cheatcodes.
         _set_discord_runtime_bot(self.bot)
+        _set_discord_runtime_controller(self)
 
         # Forum-task-board subscriptions
         self._forums_file = Path(os.getenv("DISCORD_FORUMS_PATH", "./data/discord_forums.json"))
         self.forums: set[int] = set()
         self._seen_forum_threads: set[int] = set()
         self._load_forums()
+
+        # Clear/summarize controls.
+        self._clear_marker = "[busy38:auto-clear]"
+        self._clear_window_hours = max(1, int(os.getenv("DISCORD_CLEAR_WINDOW_HOURS", "72")))
+        self._clear_max_messages = max(50, int(os.getenv("DISCORD_CLEAR_MAX_MESSAGES", "1200")))
+        self._auto_clear_min_gap_sec = max(60, int(os.getenv("DISCORD_AUTO_CLEAR_MIN_GAP_SEC", "21600")))
+        self._clear_state_file = Path(os.getenv("DISCORD_CLEAR_STATE_PATH", "./data/discord_clear_state.json"))
+        self._last_clear_by_channel: Dict[str, float] = {}
+        self._load_clear_state()
+
+        # Attachment controls (ingest + send).
+        self._attachment_include_urls_in_content = self._truthy_env("DISCORD_ATTACHMENT_INCLUDE_URLS", default="1")
+        self._attachment_text_preview_enable = self._truthy_env("DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE", default="1")
+        self._attachment_text_preview_max_bytes = max(
+            1, int(os.getenv("DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES", "65536"))
+        )
+        self._attachment_text_preview_max_chars = max(
+            80, int(os.getenv("DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS", "1200"))
+        )
+        self._agent_attachments_enable = self._truthy_env("DISCORD_AGENT_ATTACHMENTS_ENABLE", default="1")
         
         self._setup_handlers()
 
@@ -262,6 +291,261 @@ class Busy38DiscordBot:
         m = re.search(r"\[\s*react\s*:\s*([^\]\s]+)\s*\]", text, flags=re.IGNORECASE)
         reaction = m.group(1).strip() if m else None
         return is_silent, reaction
+
+    def _load_clear_state(self) -> None:
+        data = None
+        if self._clear_state_file.exists():
+            try:
+                data = json.loads(self._clear_state_file.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+        if isinstance(data, dict):
+            self._last_clear_by_channel = {str(k): float(v) for k, v in data.items()}
+        else:
+            self._last_clear_by_channel = {}
+
+    def _save_clear_state(self) -> None:
+        try:
+            self._clear_state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._clear_state_file.write_text(
+                json.dumps(self._last_clear_by_channel, indent=2, sort_keys=True, ensure_ascii=True),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write clear-state file: {e}")
+
+    @staticmethod
+    def _fallback_summary_from_rows(rows: List[Dict[str, Any]], *, max_lines: int = 20) -> str:
+        if not rows:
+            return "No transcript messages were found in the selected window."
+        lines = []
+        for r in rows[-max_lines:]:
+            meta = r.get("metadata") or {}
+            who = meta.get("author_name") or meta.get("author_id") or "unknown"
+            content = str(r.get("content") or "").replace("\n", " ").strip()
+            if len(content) > 180:
+                content = content[:180] + "..."
+            lines.append(f"- {who}: {content}")
+        return "Recent highlights:\n" + "\n".join(lines)
+
+    async def _summarize_rows_for_agents(
+        self,
+        *,
+        rows: List[Dict[str, Any]],
+        channel_name: str,
+        window_hours: int,
+    ) -> str:
+        if not rows:
+            return "No transcript messages were found in the selected window."
+
+        # Bound context to avoid giant prompts.
+        clipped = rows[-min(len(rows), 240):]
+        history_lines: List[str] = []
+        for r in clipped:
+            meta = r.get("metadata") or {}
+            who = meta.get("author_name") or meta.get("author_id") or "unknown"
+            content = str(r.get("content") or "").replace("\n", " ").strip()
+            if len(content) > 280:
+                content = content[:280] + "..."
+            history_lines.append(f"{who}: {content}")
+        history = "\n".join(history_lines)
+
+        sys_prompt = (
+            "You are Busy38 summarizing Discord channel context for agent continuity.\n"
+            "Return concise markdown with these sections:\n"
+            "1) Snapshot\n2) Decisions\n3) Active Threads\n4) Open Tasks\n5) Risks/Blockers.\n"
+            "Do not use tool tags or mission tags."
+        )
+        user_task = (
+            f"Channel: {channel_name}\n"
+            f"Window: last {window_hours} hours\n"
+            f"Messages analyzed: {len(rows)}\n\n"
+            f"History:\n{history}"
+        )
+
+        try:
+            if hasattr(self.orchestrator, "_run_loop"):
+                out = await self.orchestrator._run_loop(
+                    task=user_task,
+                    context=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_task},
+                    ],
+                    allow_delegation_tags=False,
+                    owner_label="discord_summary",
+                    max_iterations=2,
+                )
+            else:
+                out = await self.orchestrator.run_agent_loop(task=user_task)
+            out = str(out or "").strip()
+            if not out:
+                return self._fallback_summary_from_rows(rows)
+            return out
+        except Exception:
+            return self._fallback_summary_from_rows(rows)
+
+    async def _clear_channel_context(
+        self,
+        channel,
+        *,
+        initiated_by: str,
+        window_hours: Optional[int] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        if channel is None:
+            return {"success": False, "error": "channel_unavailable"}
+
+        hours = max(1, int(window_hours or self._clear_window_hours))
+        now_unix = time.time()
+        channel_id = int(getattr(channel, "id", 0))
+        key_id = str(channel_id)
+        last = float(self._last_clear_by_channel.get(key_id, 0.0))
+        age = now_unix - last
+        if (not force) and age < float(self._auto_clear_min_gap_sec):
+            return {"success": True, "skipped": "cooldown", "seconds_until_next": int(self._auto_clear_min_gap_sec - age)}
+
+        guild = getattr(channel, "guild", None)
+        gid = guild.id if guild else None
+        project_id = f"discord:{gid}:{channel_id}"
+
+        rows = []
+        try:
+            rows = self.transcript.recent_messages(
+                project_id=project_id,
+                max_age_hours=hours,
+                limit=self._clear_max_messages,
+            )
+        except Exception:
+            rows = []
+
+        channel_name = getattr(channel, "name", None) or str(channel)
+        summary = await self._summarize_rows_for_agents(rows=rows, channel_name=channel_name, window_hours=hours)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        content = (
+            f"{self._clear_marker}\n"
+            f"**Context Summary ({hours}h) - {channel_name}**\n"
+            f"_Generated by Busy38 ({initiated_by}) at {ts}_\n\n"
+            f"{summary}"
+        )
+        if len(content) > 1950:
+            content = content[:1940] + "\n..."
+
+        msg = await channel.send(content)
+
+        # Keep latest auto-clear pin, retire older ones from this bot.
+        try:
+            pins = await channel.pins()
+            for p in pins:
+                if p.id == msg.id:
+                    continue
+                if p.author.id == self.bot.user.id and str(p.content or "").startswith(self._clear_marker):
+                    try:
+                        await p.unpin(reason="Replaced by newer Busy38 context summary")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        pinned = False
+        try:
+            await msg.pin(reason="Busy38 context summary for agent continuity")
+            pinned = True
+        except Exception:
+            pinned = False
+
+        # Reset local prompt-context history to summary seed.
+        key = ChannelKey(guild_id=gid, channel_id=channel_id)
+        try:
+            self.state.reset_channel_history(key)
+            self.state.ingest_message(
+                key,
+                MessageRecord(
+                    message_id=msg.id,
+                    created_at_unix=now_unix,
+                    author_id=self.bot.user.id if self.bot and self.bot.user else 0,
+                    author_name=str(self.bot.user) if self.bot and self.bot.user else "Busy38",
+                    content=content,
+                    is_bot=True,
+                    reply_to_id=None,
+                ),
+            )
+        except Exception:
+            pass
+
+        self._last_clear_by_channel[key_id] = now_unix
+        self._save_clear_state()
+
+        return {
+            "success": True,
+            "channel_id": channel_id,
+            "project_id": project_id,
+            "messages_seen": len(rows),
+            "summary_message_id": msg.id,
+            "pinned": pinned,
+            "hours": hours,
+        }
+
+    async def run_auto_clear_cycle(self, *, trigger: str = "heartbeat", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Run one auto-clear sweep for subscribed guild channels.
+        """
+        if not self.bot or not self.bot.is_ready():
+            return {"success": True, "skipped": "discord_not_ready", "trigger": trigger}
+
+        processed = 0
+        cleared = 0
+        skipped = 0
+        errors: List[str] = []
+        for key, cfg in self.state.list_subscriptions():
+            if key.guild_id is None:
+                continue
+            guild = self.bot.get_guild(key.guild_id)
+            if guild is None:
+                continue
+            channel = guild.get_channel(key.channel_id)
+            if channel is None:
+                try:
+                    channel = await self.bot.fetch_channel(key.channel_id)
+                except Exception:
+                    continue
+            processed += 1
+            try:
+                res = await self._clear_channel_context(channel, initiated_by=trigger, force=False)
+                if res.get("skipped"):
+                    skipped += 1
+                elif res.get("success"):
+                    cleared += 1
+            except Exception as e:
+                errors.append(f"{key.channel_id}:{e}")
+
+        return {
+            "success": True,
+            "trigger": trigger,
+            "processed": processed,
+            "cleared": cleared,
+            "skipped": skipped,
+            "errors": errors,
+            "payload": payload or {},
+        }
+
+    async def _can_use_clear(self, ctx) -> bool:
+        try:
+            if await self.bot.is_owner(ctx.author):
+                return True
+        except Exception:
+            pass
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            return False
+        perms = getattr(ctx.author, "guild_permissions", None)
+        if perms is None:
+            return False
+        return bool(
+            getattr(perms, "administrator", False)
+            or getattr(perms, "manage_guild", False)
+            or getattr(perms, "manage_messages", False)
+            or getattr(perms, "moderate_members", False)
+        )
 
     def _load_subscriptions(self) -> None:
         """Load channel subscriptions from SquidKeys or local file."""
@@ -407,6 +691,13 @@ class Busy38DiscordBot:
             "Discord constraints:\n"
             "- Keep messages under ~1800 chars when possible.\n"
             "- If you need multiple parts, label them (part 1/2, 2/2).\n\n"
+            "Attachments:\n"
+            "- User attachments are included in history as metadata, with text previews when possible.\n"
+            "- To send files, include directives such as:\n"
+            "  [attach path=\"./notes.txt\" /]\n"
+            "  [attach url=\"https://example.com/image.png\" filename=\"image.png\" /]\n"
+            "  [attach base64=\"SGVsbG8=\" filename=\"note.txt\" mime_type=\"text/plain\" /]\n"
+            "- You can include multiple [attach ... /] directives in one response.\n\n"
             "Multi-agent coordination:\n"
             "- If a task is clearly assigned or handed off to another agent, prefer [no-response /].\n"
             "- If assigned/handed off to you, acknowledge briefly and take ownership.\n"
@@ -479,6 +770,49 @@ class Busy38DiscordBot:
         except ValueError:
             logger.warning("ALLOWED_USERS env var is not valid comma-separated integers")
             return None
+
+    @staticmethod
+    def _split_discord_message(text: str, *, chunk_size: int = 1900) -> List[str]:
+        s = str(text or "")
+        if not s:
+            return [""]
+        return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
+
+    async def _send_agent_response(self, channel: Any, result: str) -> None:
+        cleaned = str(result or "").strip()
+        attach_specs: List[Dict[str, Any]] = []
+        if self._agent_attachments_enable:
+            cleaned, attach_specs = parse_attach_directives(cleaned)
+
+        files: List[Any] = []
+        attachment_errors: List[str] = []
+        if attach_specs:
+            files, attachment_errors = await build_discord_files(attach_specs)
+
+        if attachment_errors:
+            err_lines = "\n".join(f"- {e}" for e in attachment_errors[:8])
+            err_block = f"⚠️ Attachment errors:\n{err_lines}"
+            cleaned = (cleaned + "\n\n" + err_block).strip() if cleaned else err_block
+
+        chunks = self._split_discord_message(cleaned, chunk_size=1900)
+        try:
+            if files:
+                first = chunks[0]
+                if len(chunks) > 1:
+                    first = (first + f"\n\n(part 1/{len(chunks)})").strip()
+                first_payload = first if first else None
+                await channel.send(content=first_payload, files=files or None)
+                for idx, chunk in enumerate(chunks[1:], start=2):
+                    suffix = f"\n\n(part {idx}/{len(chunks)})" if len(chunks) > 1 else ""
+                    await channel.send((chunk + suffix).strip())
+            else:
+                for idx, chunk in enumerate(chunks, start=1):
+                    suffix = f"\n\n(part {idx}/{len(chunks)})" if len(chunks) > 1 else ""
+                    payload = (chunk + suffix).strip()
+                    if payload:
+                        await channel.send(payload)
+        finally:
+            close_discord_files(files)
     
     def _setup_handlers(self):
         """Set up Discord event handlers."""
@@ -519,12 +853,22 @@ class Busy38DiscordBot:
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
 
-            # Normalize content (include attachments as URLs)
+            # Normalize content and include attachment summary/URLs.
             content = message.content or ""
+            attachments: List[Dict[str, Any]] = []
             try:
-                atts = getattr(message, "attachments", None) or []
-                if atts:
-                    urls = [a.url for a in atts if getattr(a, "url", None)]
+                attachments = await extract_message_attachments(
+                    message,
+                    include_text_preview=self._attachment_text_preview_enable,
+                    preview_max_bytes=self._attachment_text_preview_max_bytes,
+                    preview_max_chars=self._attachment_text_preview_max_chars,
+                )
+                if attachments:
+                    summary = attachment_summary_line(attachments)
+                    if summary:
+                        content = (content + "\n" + summary).strip()
+                if self._attachment_include_urls_in_content and attachments:
+                    urls = [str(a.get("url")) for a in attachments if a.get("url")]
                     if urls:
                         content = (content + "\n" + "\n".join(urls)).strip()
             except Exception:
@@ -538,6 +882,7 @@ class Busy38DiscordBot:
                 content=content,
                 is_bot=bool(getattr(message.author, "bot", False)),
                 reply_to_id=getattr(getattr(message, "reference", None), "message_id", None),
+                attachments=attachments,
             )
             self.state.ingest_message(key, rec)
 
@@ -558,6 +903,7 @@ class Busy38DiscordBot:
                         "author_id": message.author.id,
                         "author_name": str(message.author),
                         "is_bot": bool(getattr(message.author, "bot", False)),
+                        "attachments": attachments,
                     },
                 )
             except Exception:
@@ -796,15 +1142,7 @@ class Busy38DiscordBot:
                                         pass
                         return
                     
-                    # Send response (split if too long)
-                    if len(result) > 2000:
-                        # Discord limit is 2000 chars
-                        chunks = [result[i:i+1900] for i in range(0, len(result), 1900)]
-                        for i, chunk in enumerate(chunks):
-                            suffix = f"\n\n(part {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
-                            await message.channel.send(chunk + suffix)
-                    else:
-                        await message.channel.send(result)
+                    await self._send_agent_response(message.channel, result)
                     
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
@@ -870,6 +1208,40 @@ class Busy38DiscordBot:
             for k, v in sorted(subs.items()):
                 lines.append(f"- `{k}` follow_mode={v.get('follow_mode')} history_limit={v.get('history_limit')}")
             await ctx.send("\n".join(lines))
+
+        @self.bot.command(name="clear")
+        async def clear_cmd(ctx, hours: int = 72):
+            """
+            Summarize recent channel context, pin it, and reset in-memory prompt history.
+
+            Access: owner OR admin/mod roles with manage privileges.
+            """
+            if not await self._can_use_clear(ctx):
+                await ctx.send("❌ You need owner/admin/mod permissions (`manage_messages` or `administrator`) to run clear.")
+                return
+            if hours < 1:
+                hours = 1
+            if hours > 168:
+                hours = 168
+            try:
+                res = await self._clear_channel_context(
+                    ctx.channel,
+                    initiated_by=f"user:{ctx.author.id}",
+                    window_hours=hours,
+                    force=True,
+                )
+                if not res.get("success"):
+                    await ctx.send(f"❌ clear failed: {res.get('error', 'unknown error')}")
+                    return
+                await ctx.send(
+                    "✓ Context summarized and reset.\n"
+                    f"- window: {res.get('hours')}h\n"
+                    f"- messages analyzed: {res.get('messages_seen')}\n"
+                    f"- summary message id: {res.get('summary_message_id')}\n"
+                    f"- pinned: {res.get('pinned')}"
+                )
+            except Exception as e:
+                await ctx.send(f"❌ clear failed: {e}")
 
         @self.bot.command(name="forum_subscribe")
         @commands.is_owner()
@@ -1024,6 +1396,7 @@ class Busy38DiscordBot:
                     "`!busy38 unsubscribe` - Unsubscribe current channel\n"
                     "`!busy38 follow on|off` - Toggle follow-mode for current channel\n"
                     "`!busy38 subs` - List subscriptions\n\n"
+                    "`!busy38 clear [hours]` - Summarize and pin context; reset in-memory channel history\n\n"
                     "`!busy38 forum_subscribe` - Subscribe this forum as a task board\n"
                     "`!busy38 forum_unsubscribe` - Unsubscribe this forum\n"
                     "`!busy38 forums` - List forum subscriptions\n\n"
@@ -1115,6 +1488,8 @@ class Busy38DiscordBot:
         """Stop the Discord bot."""
         logger.info("Stopping Discord bot...")
         await self.bot.close()
+        _set_discord_runtime_bot(None)
+        _set_discord_runtime_controller(None)
 
         try:
             self.transcript.close()

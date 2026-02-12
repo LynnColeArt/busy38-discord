@@ -8,13 +8,21 @@ Implementation path: `toolkit/discord_bot.py`
 
 Key behavior:
 - Ingests all channel traffic and decides when to respond.
+- Captures attachment metadata from inbound messages (filename/type/size/url) with optional text previews.
 - Supports subscribe/follow controls and forum task-board subscriptions.
 - Applies 24h recency bias by default for context/search.
+- Supports moderated context reset:
+  - `!busy38 clear [hours]` summarizes last N hours, posts + pins summary, resets in-memory channel context seed.
 - Supports silent acknowledgements:
   - `[no-response /]`
   - optional `[react:EMOJI]`
+- Supports attachment directives in agent replies:
+  - `[attach path="./artifact.txt" /]`
+  - `[attach url="https://example.com/image.png" filename="image.png" /]`
+  - `[attach base64="SGVsbG8=" filename="hello.txt" mime_type="text/plain" /]`
 - Uses anti-spam guardrails for follow-mode in high-traffic channels.
 - Adds assignment/handoff coordination hints for multi-agent channels.
+- Supports heartbeat auto-clear registration when enabled.
 
 Core env controls:
 - `DISCORD_CONTEXT_MAX_AGE_SEC` (default `86400`)
@@ -24,6 +32,18 @@ Core env controls:
 - `DISCORD_FOLLOW_SPAM_WINDOW_SEC` (default `30`)
 - `DISCORD_FOLLOW_SPAM_MAX_EVENTS` (default `12`)
 - `DISCORD_FOLLOW_SPAM_COOLDOWN_SEC` (default `45`)
+- `DISCORD_CLEAR_WINDOW_HOURS` (default `72`)
+- `DISCORD_CLEAR_MAX_MESSAGES` (default `1200`)
+- `DISCORD_AUTO_CLEAR_ENABLE` (default `0`)
+- `DISCORD_AUTO_CLEAR_INTERVAL_SEC` (default `900`)
+- `DISCORD_AUTO_CLEAR_MIN_GAP_SEC` (default `21600`)
+- `DISCORD_AGENT_ATTACHMENTS_ENABLE` (default `1`)
+- `DISCORD_ATTACHMENT_MAX_BYTES` (default `8000000`)
+- `DISCORD_ATTACHMENT_MAX_FILES` (default `10`)
+- `DISCORD_ATTACHMENT_INCLUDE_URLS` (default `1`)
+- `DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE` (default `1`)
+- `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES` (default `65536`)
+- `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS` (default `1200`)
 
 ## Namespace: `dlog`
 
@@ -85,6 +105,16 @@ Post a message in a thread:
 [dforum:reply thread_id=123 content="Status: investigating" /]
 ```
 
+With attachments:
+```text
+[dforum:reply thread_id=123 content="Logs attached"
+  attachments='[
+    {"path":"./data/error.log"},
+    {"url":"https://example.com/diag.png","filename":"diag.png"},
+    {"base64":"SGVsbG8=","filename":"hello.txt","mime_type":"text/plain"}
+  ]' /]
+```
+
 ### `dforum:set_tags`
 
 Apply forum tags to a thread by name:
@@ -120,12 +150,23 @@ Create a new forum post (thread):
 [dforum:create_post forum_id=999 title="Task: Audit errors" content="Please investigate..." tag_names="New" /]
 ```
 
+With attachments:
+```text
+[dforum:create_post forum_id=999 title="Incident" content="Initial report"
+  attachments='[
+    {"path":"./reports/incident.txt"},
+    {"data_uri":"data:text/plain;base64,SGVsbG8=","filename":"inline.txt"}
+  ]' /]
+```
+
 ### `dforum:get_thread`
 
 Fetch recent messages and applied tags:
 ```text
 [dforum:get_thread thread_id=123 limit=30 /]
 ```
+
+Returns each message with `attachments` metadata when present.
 
 ## Security Notes
 

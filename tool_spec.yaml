@@ -107,6 +107,14 @@ namespaces:
         parameters:
           thread_id: { type: integer, required: true }
           content: { type: string, required: true }
+          attachments:
+            type: any
+            required: false
+            description: >
+              Optional attachments (list/object/JSON string). Each item may be
+              {"path":"..."} for local files, {"url":"...","filename":"..."},
+              {"base64":"...","filename":"...","mime_type":"..."},
+              or {"data_uri":"data:...;base64,...","filename":"..."}.
       rename:
         description: Rename a thread.
         parameters:
@@ -137,9 +145,14 @@ namespaces:
           title: { type: string, required: true }
           content: { type: string, required: true }
           tag_names: { type: string, required: false, default: "" }
+          attachments:
+            type: any
+            required: false
+            description: >
+              Optional attachments to post immediately after thread creation.
+              Supports path/url/base64/data_uri objects.
       get_thread:
         description: Fetch recent thread messages plus applied tags.
         parameters:
           thread_id: { type: integer, required: true }
           limit: { type: integer, required: false, default: 30 }
-

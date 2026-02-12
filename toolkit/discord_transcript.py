@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -240,6 +240,57 @@ class DiscordTranscriptLogger:
                     "timestamp": ts2.isoformat() if hasattr(ts2, "isoformat") else str(ts2),
                     "project_id": pid2,
                     "content": content2 or "",
+                    "metadata": meta_obj,
+                }
+            )
+        return out
+
+    def recent_messages(
+        self,
+        *,
+        project_id: str,
+        since: Optional[datetime] = None,
+        max_age_hours: int = 72,
+        limit: int = 800,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch recent messages for one discord project/channel in chronological order.
+        """
+        if self._conn is None:
+            self.connect()
+
+        if since is None and int(max_age_hours) > 0:
+            since = datetime.now(timezone.utc) - timedelta(hours=int(max_age_hours))
+
+        clauses = ["project_id = ?"]
+        params: List[Any] = [project_id]
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since.isoformat())
+        params.append(int(limit))
+
+        rows = self._conn.execute(
+            f"""
+            SELECT id, timestamp, content, metadata
+            FROM chat_entries
+            WHERE {' AND '.join(clauses)}
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for rid, ts, content, meta in rows:
+            try:
+                meta_obj = json.loads(meta) if isinstance(meta, str) and meta else {}
+            except Exception:
+                meta_obj = {}
+            out.append(
+                {
+                    "id": rid,
+                    "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                    "content": content or "",
                     "metadata": meta_obj,
                 }
             )

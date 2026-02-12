@@ -13,7 +13,7 @@ import json
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class MessageRecord:
     content: str
     is_bot: bool
     reply_to_id: Optional[int] = None
+    attachments: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -97,6 +98,15 @@ class DiscordStateStore:
         st.cfg.history_limit = int(limit)
         st._ensure_maxlen()
 
+    def reset_channel_history(self, key: ChannelKey) -> None:
+        """
+        Clear rolling history/participants for a single channel while preserving config.
+        """
+        st = self._get(key)
+        st.history.clear()
+        st.participants.clear()
+        st.bot_participants.clear()
+
     def channel_config(self, key: ChannelKey) -> ChannelConfig:
         return self._get(key).cfg
 
@@ -138,7 +148,20 @@ class DiscordStateStore:
                 continue
             # Keep formatting stable; Discord IDs help identify agents.
             who = f"{m.author_name} ({m.author_id})"
-            lines.append(f"{who}: {m.content}")
+            line = f"{who}: {m.content}"
+            if m.attachments:
+                names: List[str] = []
+                for att in m.attachments[:4]:
+                    filename = str(att.get("filename") or "file")
+                    size = att.get("size")
+                    if isinstance(size, int):
+                        names.append(f"{filename} ({size}B)")
+                    else:
+                        names.append(filename)
+                if len(m.attachments) > 4:
+                    names.append(f"+{len(m.attachments) - 4} more")
+                line += f" [attachments: {', '.join(names)}]"
+            lines.append(line)
         return lines
 
     def export_subscriptions(self) -> Dict[str, Dict]:

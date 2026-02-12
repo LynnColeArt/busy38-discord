@@ -13,10 +13,56 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
+import os
+import logging
 
 from core.cheatcodes.registry import register_namespace
 from .discord_transcript import DiscordTranscriptLogger
-from .discord_runtime import get_bot
+from .discord_runtime import get_bot, run_auto_clear_cycle
+from .discord_attachments import build_discord_files, close_discord_files, normalize_attachment_specs
+
+logger = logging.getLogger(__name__)
+_heartbeat_hook_registered = False
+
+
+def _truthy(raw: str) -> bool:
+    v = (raw or "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
+def _maybe_register_heartbeat_jobs() -> None:
+    """
+    Register heartbeat hook callback that installs discord auto-clear jobs.
+
+    This remains plugin-local and only activates if heartbeat hooks are available.
+    """
+    global _heartbeat_hook_registered
+    if _heartbeat_hook_registered:
+        return
+    _heartbeat_hook_registered = True
+
+    try:
+        from core.hooks import on_heartbeat_register_jobs
+    except Exception:
+        logger.debug("Heartbeat hooks unavailable; skipping discord auto-clear hook registration")
+        return
+
+    @on_heartbeat_register_jobs(priority=20)
+    def _register_discord_jobs(manager, context=None):
+        if not _truthy(os.getenv("DISCORD_AUTO_CLEAR_ENABLE", "0")):
+            return
+        interval = max(60, int(os.getenv("DISCORD_AUTO_CLEAR_INTERVAL_SEC", "900")))
+        manager.register_job(
+            name="discord_auto_clear",
+            interval_seconds=interval,
+            source="plugin:busy-38-discord",
+            run_immediately=False,
+            callback=run_auto_clear_cycle,
+            metadata={
+                "window_hours": int(os.getenv("DISCORD_CLEAR_WINDOW_HOURS", "72")),
+                "min_gap_sec": int(os.getenv("DISCORD_AUTO_CLEAR_MIN_GAP_SEC", "21600")),
+            },
+        )
 
 
 @dataclass
@@ -85,12 +131,10 @@ class Toolkit:
     """Vendor plugin entry point (auto-instantiated by PluginManager)."""
 
     def __init__(self):
-        # Match Busy's transcript logger data dir env var.
-        import os
-
         data_dir = os.getenv("BUSY38_CHATLOG_DIR", "./data/memory")
         register_namespace("dlog", _DiscordLogHandler(data_dir=data_dir))
         register_namespace("dforum", _DiscordForumHandler())
+        _maybe_register_heartbeat_jobs()
 
 
 class _DiscordForumHandler:
@@ -124,10 +168,17 @@ class _DiscordForumHandler:
             ch = await bot.fetch_channel(channel_id)
         return ch
 
-    async def _reply(self, thread_id: int, content: str, **_: Any) -> Dict[str, Any]:
+    async def _reply(self, thread_id: int, content: str, attachments: Any = None, **_: Any) -> Dict[str, Any]:
         ch = await self._fetch_channel(int(thread_id))
-        msg = await ch.send(str(content))
-        return {"success": True, "message_id": msg.id}
+        files, attachment_errors = await build_discord_files(normalize_attachment_specs(attachments))
+        try:
+            msg = await ch.send(content=str(content or ""), files=files or None)
+        finally:
+            close_discord_files(files)
+        out = {"success": True, "message_id": msg.id, "attachments_sent": len(files)}
+        if attachment_errors:
+            out["attachment_errors"] = attachment_errors
+        return out
 
     async def _rename(self, thread_id: int, name: str, **_: Any) -> Dict[str, Any]:
         th = await self._fetch_channel(int(thread_id))
@@ -164,7 +215,15 @@ class _DiscordForumHandler:
         await th.edit(applied_tags=tags)
         return {"success": True, "applied": [t.name for t in tags]}
 
-    async def _create_post(self, forum_id: int, title: str, content: str, tag_names: str = "", **_: Any) -> Dict[str, Any]:
+    async def _create_post(
+        self,
+        forum_id: int,
+        title: str,
+        content: str,
+        tag_names: str = "",
+        attachments: Any = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
         forum = await self._fetch_channel(int(forum_id))
         wanted = [t.strip() for t in str(tag_names).split(",") if t.strip()]
         tags = []
@@ -178,7 +237,18 @@ class _DiscordForumHandler:
         thread = await forum.create_thread(name=str(title), content=str(content), applied_tags=tags)
         # discord.py returns (thread, message) sometimes depending on version; normalize.
         th = thread[0] if isinstance(thread, (tuple, list)) else thread
-        return {"success": True, "thread_id": th.id}
+        out: Dict[str, Any] = {"success": True, "thread_id": th.id}
+        files, attachment_errors = await build_discord_files(normalize_attachment_specs(attachments))
+        if files:
+            try:
+                attachment_msg = await th.send(content="Attachments", files=files or None)
+                out["attachment_message_id"] = attachment_msg.id
+                out["attachments_sent"] = len(files)
+            finally:
+                close_discord_files(files)
+        if attachment_errors:
+            out["attachment_errors"] = attachment_errors
+        return out
 
     async def _get_thread(self, thread_id: int, limit: int = 30, **_: Any) -> Dict[str, Any]:
         th = await self._fetch_channel(int(thread_id))
@@ -192,6 +262,16 @@ class _DiscordForumHandler:
                     "author_id": m.author.id,
                     "content": m.content,
                     "created_at": m.created_at.isoformat() if getattr(m, "created_at", None) else None,
+                    "attachments": [
+                        {
+                            "id": int(getattr(a, "id", 0) or 0),
+                            "filename": str(getattr(a, "filename", "") or "attachment"),
+                            "size": int(getattr(a, "size", 0) or 0),
+                            "content_type": getattr(a, "content_type", None),
+                            "url": getattr(a, "url", None),
+                        }
+                        for a in (getattr(m, "attachments", None) or [])
+                    ],
                 }
             )
         msgs.reverse()
