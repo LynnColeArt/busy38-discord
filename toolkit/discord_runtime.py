@@ -8,10 +8,13 @@ async cheatcode handlers can access Discord APIs.
 
 from __future__ import annotations
 
+import contextlib
+from contextvars import ContextVar
 from typing import Optional, Any, Dict
 
 _bot: Optional[Any] = None
 _controller: Optional[Any] = None
+_active_context: ContextVar[Optional[Dict[str, Any]]] = ContextVar("busy38_discord_active_context", default=None)
 
 
 def set_bot(bot: Any) -> None:
@@ -30,6 +33,19 @@ def set_controller(controller: Any) -> None:
 
 def get_controller() -> Any:
     return _controller
+
+
+def get_active_context() -> Optional[Dict[str, Any]]:
+    return _active_context.get()
+
+
+@contextlib.contextmanager
+def bind_active_context(ctx: Dict[str, Any]):
+    token = _active_context.set(ctx)
+    try:
+        yield
+    finally:
+        _active_context.reset(token)
 
 
 async def run_auto_clear_cycle(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

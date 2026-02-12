@@ -50,7 +50,11 @@ from .discord_attachments import (
 from core.security.hardware_auth import require_hardware_auth, hardware_auth_is_configured, HardwareAuthError
 
 # Runtime bridge for vendor discord tools (dforum)
-from .discord_runtime import set_bot as _set_discord_runtime_bot, set_controller as _set_discord_runtime_controller
+from .discord_runtime import (
+    set_bot as _set_discord_runtime_bot,
+    set_controller as _set_discord_runtime_controller,
+    bind_active_context as _bind_discord_active_context,
+)
 
 # SquidKeys integration
 try:
@@ -200,6 +204,16 @@ class Busy38DiscordBot:
             80, int(os.getenv("DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS", "1200"))
         )
         self._agent_attachments_enable = self._truthy_env("DISCORD_AGENT_ATTACHMENTS_ENABLE", default="1")
+
+        # Optional status narration (low-noise, action-style updates while working).
+        self._status_enable = self._truthy_env("DISCORD_STATUS_ENABLE", default="0")
+        self._status_mode = (os.getenv("DISCORD_STATUS_MODE", "edit") or "edit").strip().lower()
+        self._status_delay_sec = max(0.0, float(os.getenv("DISCORD_STATUS_DELAY_SEC", "1.5")))
+        self._status_min_interval_sec = max(0.2, float(os.getenv("DISCORD_STATUS_MIN_INTERVAL_SEC", "2.5")))
+        self._status_delete_on_finish = self._truthy_env("DISCORD_STATUS_DELETE_ON_FINISH", default="1")
+        self._status_include_args = self._truthy_env("DISCORD_STATUS_INCLUDE_ARGS", default="0")
+        self._status_msg_by_channel: Dict[int, Any] = {}
+        self._status_last_update_unix: Dict[int, float] = {}
         
         self._setup_handlers()
 
@@ -778,6 +792,74 @@ class Busy38DiscordBot:
             return [""]
         return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
 
+    def _status_actor(self) -> str:
+        try:
+            if getattr(self.bot, "user", None):
+                return getattr(self.bot.user, "display_name", None) or getattr(self.bot.user, "name", None) or "Busy38"
+        except Exception:
+            pass
+        return "Busy38"
+
+    def _format_status_line(self, activity: str) -> str:
+        a = (activity or "").strip()
+        if not a:
+            a = "working"
+        actor = self._status_actor()
+        # Discord has no /me for bots; emulate with an action-style italic message.
+        if a.lower().startswith(("is ", "are ")):
+            return f"*{actor} {a}…*"
+        return f"*{actor} is {a}…*"
+
+    async def _status_set(self, channel: Any, activity: str, *, force: bool = False) -> None:
+        if not self._status_enable:
+            return
+        if self._status_mode in ("off", "none", "0"):
+            return
+
+        now = time.time()
+        cid = int(getattr(channel, "id", 0) or 0)
+        if cid:
+            last = float(self._status_last_update_unix.get(cid, 0.0))
+            if (not force) and (now - last) < float(self._status_min_interval_sec):
+                return
+            self._status_last_update_unix[cid] = now
+
+        text = self._format_status_line(activity)
+        msg = self._status_msg_by_channel.get(cid) if cid else None
+        try:
+            if self._status_mode == "message" or msg is None:
+                msg = await channel.send(text)
+                if cid:
+                    self._status_msg_by_channel[cid] = msg
+                return
+            await msg.edit(content=text)
+        except Exception:
+            # Non-fatal (missing perms / rate limits / deleted message).
+            try:
+                if cid and cid in self._status_msg_by_channel:
+                    del self._status_msg_by_channel[cid]
+            except Exception:
+                pass
+
+    async def post_status(self, channel: Any, activity: str, *, force: bool = False) -> None:
+        """Public wrapper used by hook handlers to narrate work."""
+        await self._status_set(channel, activity, force=force)
+
+    async def _status_clear(self, channel: Any) -> None:
+        if not self._status_enable:
+            return
+        cid = int(getattr(channel, "id", 0) or 0)
+        msg = self._status_msg_by_channel.pop(cid, None) if cid else None
+        if not msg:
+            return
+        try:
+            if self._status_delete_on_finish:
+                await msg.delete()
+            else:
+                await msg.edit(content=self._format_status_line("done"))
+        except Exception:
+            return
+
     async def _send_agent_response(self, channel: Any, result: str) -> None:
         cleaned = str(result or "").strip()
         attach_specs: List[Dict[str, Any]] = []
@@ -1117,15 +1199,37 @@ class Busy38DiscordBot:
                     async with lock:
                         self._last_invoke_unix[message.channel.id] = time.time()
 
+                        status_task = None
+                        if self._status_enable:
+                            async def _delayed_status():
+                                await asyncio.sleep(self._status_delay_sec)
+                                await self._status_set(message.channel, "thinking")
+
+                            status_task = asyncio.create_task(_delayed_status())
+
                         # Route to orchestrator with full channel context.
-                        result = await _invoke_agent_for_message(
-                            message,
-                            content,
-                            is_dm=is_dm,
-                            is_mentioned=is_mentioned or is_reply_to_me,
-                            trigger_override="forum_task" if is_new_forum_task else None,
-                            coordination=coordination,
-                        )
+                        # Bind an active context so hook handlers (cheatcodes) can narrate status.
+                        with _bind_discord_active_context(
+                            {
+                                "guild_id": gid,
+                                "channel_id": message.channel.id,
+                                "channel": message.channel,
+                                "trigger_message_id": message.id,
+                                "trigger_author_id": getattr(message.author, "id", None),
+                            }
+                        ):
+                            result = await _invoke_agent_for_message(
+                                message,
+                                content,
+                                is_dm=is_dm,
+                                is_mentioned=is_mentioned or is_reply_to_me,
+                                trigger_override="forum_task" if is_new_forum_task else None,
+                                coordination=coordination,
+                            )
+
+                        if status_task:
+                            status_task.cancel()
+                        await self._status_clear(message.channel)
 
                     # True silence: the agent can emit [no-response /], optional [react:EMOJI].
                     is_silent, requested_reaction = self._parse_no_response_directives(result)
@@ -1146,6 +1250,10 @@ class Busy38DiscordBot:
                     
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
+                    try:
+                        await self._status_clear(message.channel)
+                    except Exception:
+                        pass
                     await message.channel.send(f"❌ Error: {str(e)[:500]}")
         
         # Simple commands

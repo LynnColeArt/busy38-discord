@@ -25,6 +25,7 @@ This plugin is intended to be **vendored into Busy38** under `./vendor/busy-38-d
   - hardware-auth enforcement hooks
   - moderated `!busy38 clear [hours]` summary+pin context reset flow
   - optional heartbeat-driven auto-clear job registration via hooks
+  - optional status narration messages during work (action-style)
 
 ### Agent Cheatcodes
 
@@ -72,6 +73,12 @@ See `API_REFERENCE.md` and `tool_spec.yaml`.
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE`: attempt text previews for small text-like files (default `1`)
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES`: max inbound file size for preview extraction (default `65536`)
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS`: max preview characters saved per attachment (default `1200`)
+- `DISCORD_STATUS_ENABLE`: enable action-style status messages during work (default `0`)
+- `DISCORD_STATUS_MODE`: `edit` (single message updated) or `message` (new message per update) (default `edit`)
+- `DISCORD_STATUS_DELAY_SEC`: delay before posting initial “thinking” status (default `1.5`)
+- `DISCORD_STATUS_MIN_INTERVAL_SEC`: minimum time between status edits/sends per channel (default `2.5`)
+- `DISCORD_STATUS_DELETE_ON_FINISH`: delete status message after response (default `1`)
+- `DISCORD_STATUS_INCLUDE_ARGS`: include tool args in narration (reserved; default `0`)
 
 ## Licensing
 

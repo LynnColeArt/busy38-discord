@@ -18,11 +18,12 @@ import logging
 
 from core.cheatcodes.registry import register_namespace
 from .discord_transcript import DiscordTranscriptLogger
-from .discord_runtime import get_bot, run_auto_clear_cycle
+from .discord_runtime import get_bot, get_controller, get_active_context, run_auto_clear_cycle
 from .discord_attachments import build_discord_files, close_discord_files, normalize_attachment_specs
 
 logger = logging.getLogger(__name__)
 _heartbeat_hook_registered = False
+_status_hook_registered = False
 
 
 def _truthy(raw: str) -> bool:
@@ -63,6 +64,101 @@ def _maybe_register_heartbeat_jobs() -> None:
                 "min_gap_sec": int(os.getenv("DISCORD_AUTO_CLEAR_MIN_GAP_SEC", "21600")),
             },
         )
+
+
+def _schedule_coro(coro) -> None:
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+    except Exception:
+        return
+
+
+def _status_activity_for_cheatcode(namespace: str, action: str, attributes: Dict[str, Any]) -> Optional[str]:
+    ns = str(namespace or "").strip().lower()
+    act = str(action or "").strip().lower()
+
+    if ns == "rw4":
+        if act == "read_file":
+            return "opening a file"
+        if act == "read_range":
+            return "reading a file section"
+        if act == "write_file":
+            return "writing a file"
+        if act == "list":
+            return "checking the workspace"
+        if act == "shell":
+            return "running a command"
+        if act == "git_status":
+            return "checking git status"
+        if act == "git_diff":
+            return "reviewing changes"
+        if act == "git_commit":
+            return "committing changes"
+        if act == "lsp_diagnostics":
+            return "checking diagnostics"
+
+    if ns == "dlog":
+        if act == "search":
+            return "searching the channel history"
+        if act == "around":
+            return "reviewing recent context"
+
+    if ns == "dforum":
+        if act == "create_post":
+            return "creating a forum post"
+        if act == "reply":
+            return "posting an update"
+        if act == "rename":
+            return "updating a thread title"
+        if act == "set_tags":
+            return "updating thread tags"
+        if act == "archive":
+            return "archiving a thread"
+        if act == "lock":
+            return "locking a thread"
+        if act == "get_thread":
+            return "reviewing a thread"
+
+    return None
+
+
+def _maybe_register_status_hooks() -> None:
+    """
+    Register hook handlers that can narrate tool/cheatcode progress in Discord.
+
+    Implemented as best-effort. If Busy38 core doesn't provide the hook points,
+    this becomes a no-op.
+    """
+    global _status_hook_registered
+    if _status_hook_registered:
+        return
+    _status_hook_registered = True
+
+    try:
+        from core.hooks import on_pre_cheatcode_execute
+    except Exception:
+        logger.debug("Cheatcode hooks unavailable; skipping discord status hook registration")
+        return
+
+    @on_pre_cheatcode_execute(priority=40)
+    def _discord_status_on_cheatcode(namespace: str, action: str, attributes: Dict[str, Any], context=None):
+        ctrl = get_controller()
+        if ctrl is None:
+            return
+        ctx = get_active_context() or {}
+        ch = ctx.get("channel")
+        if ch is None:
+            return
+
+        activity = _status_activity_for_cheatcode(namespace, action, attributes or {})
+        if not activity:
+            return
+
+        # Keep it lightweight: narration is controlled by the controller env flags.
+        _schedule_coro(ctrl.post_status(ch, activity))
 
 
 @dataclass
@@ -135,6 +231,7 @@ class Toolkit:
         register_namespace("dlog", _DiscordLogHandler(data_dir=data_dir))
         register_namespace("dforum", _DiscordForumHandler())
         _maybe_register_heartbeat_jobs()
+        _maybe_register_status_hooks()
 
 
 class _DiscordForumHandler:

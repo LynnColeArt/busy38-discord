@@ -23,6 +23,9 @@ Key behavior:
 - Uses anti-spam guardrails for follow-mode in high-traffic channels.
 - Adds assignment/handoff coordination hints for multi-agent channels.
 - Supports heartbeat auto-clear registration when enabled.
+- Optional “status narration”:
+  - action-style messages such as `*Busy38 is opening a file…*` while work is in progress.
+  - designed to be low-noise (single editable message by default).
 
 Core env controls:
 - `DISCORD_CONTEXT_MAX_AGE_SEC` (default `86400`)
@@ -44,6 +47,11 @@ Core env controls:
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE` (default `1`)
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES` (default `65536`)
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS` (default `1200`)
+- `DISCORD_STATUS_ENABLE` (default `0`)
+- `DISCORD_STATUS_MODE` (default `edit`)
+- `DISCORD_STATUS_DELAY_SEC` (default `1.5`)
+- `DISCORD_STATUS_MIN_INTERVAL_SEC` (default `2.5`)
+- `DISCORD_STATUS_DELETE_ON_FINISH` (default `1`)
 
 ## Namespace: `dlog`
 
