@@ -251,6 +251,7 @@ class DiscordTranscriptLogger:
         project_id: str,
         since: Optional[datetime] = None,
         max_age_hours: int = 72,
+        now: Optional[datetime] = None,
         limit: int = 800,
     ) -> List[Dict[str, Any]]:
         """
@@ -260,7 +261,8 @@ class DiscordTranscriptLogger:
             self.connect()
 
         if since is None and int(max_age_hours) > 0:
-            since = datetime.now(timezone.utc) - timedelta(hours=int(max_age_hours))
+            ref = now or datetime.now(timezone.utc)
+            since = ref - timedelta(hours=int(max_age_hours))
 
         clauses = ["project_id = ?"]
         params: List[Any] = [project_id]
