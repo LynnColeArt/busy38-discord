@@ -75,6 +75,7 @@ See `API_REFERENCE.md` and `tool_spec.yaml`.
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS`: max preview characters saved per attachment (default `1200`)
 - `DISCORD_STATUS_ENABLE`: enable action-style status messages during work (default `0`)
 - `DISCORD_STATUS_MODE`: `edit` (single message updated) or `message` (new message per update) (default `edit`)
+- `DISCORD_STATUS_STYLE`: `implicit` (like `/me`, do not repeat bot name in message body) or `explicit` (include name) (default `implicit`)
 - `DISCORD_STATUS_DELAY_SEC`: delay before posting initial “thinking” status (default `1.5`)
 - `DISCORD_STATUS_MIN_INTERVAL_SEC`: minimum time between status edits/sends per channel (default `2.5`)
 - `DISCORD_STATUS_DELETE_ON_FINISH`: delete status message after response (default `1`)

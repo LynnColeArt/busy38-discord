@@ -208,6 +208,7 @@ class Busy38DiscordBot:
         # Optional status narration (low-noise, action-style updates while working).
         self._status_enable = self._truthy_env("DISCORD_STATUS_ENABLE", default="0")
         self._status_mode = (os.getenv("DISCORD_STATUS_MODE", "edit") or "edit").strip().lower()
+        self._status_style = (os.getenv("DISCORD_STATUS_STYLE", "implicit") or "implicit").strip().lower()
         self._status_delay_sec = max(0.0, float(os.getenv("DISCORD_STATUS_DELAY_SEC", "1.5")))
         self._status_min_interval_sec = max(0.2, float(os.getenv("DISCORD_STATUS_MIN_INTERVAL_SEC", "2.5")))
         self._status_delete_on_finish = self._truthy_env("DISCORD_STATUS_DELETE_ON_FINISH", default="1")
@@ -804,11 +805,22 @@ class Busy38DiscordBot:
         a = (activity or "").strip()
         if not a:
             a = "working"
-        actor = self._status_actor()
-        # Discord has no /me for bots; emulate with an action-style italic message.
+        # Discord has no API primitive for /me; emulate with an action-style italic message.
+        # "implicit" mode avoids repeating the bot's name (author line already shows it).
+        # "explicit" repeats the name in message body.
+        style = self._status_style
+        if style not in ("implicit", "explicit"):
+            style = "implicit"
+
+        if style == "explicit":
+            actor = self._status_actor()
+            if a.lower().startswith(("is ", "are ")):
+                return f"*{actor} {a}…*"
+            return f"*{actor} is {a}…*"
+
         if a.lower().startswith(("is ", "are ")):
-            return f"*{actor} {a}…*"
-        return f"*{actor} is {a}…*"
+            return f"*{a}…*"
+        return f"*is {a}…*"
 
     async def _status_set(self, channel: Any, activity: str, *, force: bool = False) -> None:
         if not self._status_enable:

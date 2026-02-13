@@ -49,6 +49,7 @@ Core env controls:
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS` (default `1200`)
 - `DISCORD_STATUS_ENABLE` (default `0`)
 - `DISCORD_STATUS_MODE` (default `edit`)
+- `DISCORD_STATUS_STYLE` (default `implicit`)
 - `DISCORD_STATUS_DELAY_SEC` (default `1.5`)
 - `DISCORD_STATUS_MIN_INTERVAL_SEC` (default `2.5`)
 - `DISCORD_STATUS_DELETE_ON_FINISH` (default `1`)
