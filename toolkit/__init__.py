@@ -125,6 +125,43 @@ def _status_activity_for_cheatcode(namespace: str, action: str, attributes: Dict
     return None
 
 
+def _status_activity_for_mission(event: str, payload: Dict[str, Any]) -> Optional[str]:
+    if event == "mission.started":
+        objective = str(payload.get("objective") or "").strip()
+        return f"starting mission: {objective}" if objective else "starting mission"
+    if event == "mission.step.started":
+        step = payload.get("step")
+        return f"working on step {step}" if step else "working on a mission step"
+    if event == "mission.awaiting_orchestrator":
+        step = payload.get("step")
+        return f"waiting for guidance for step {step}" if step else "waiting for orchestrator guidance"
+    if event == "mission.orchestrator_guidance":
+        return "got guidance, continuing execution"
+    if event == "mission.step.completed":
+        step = payload.get("step")
+        return f"completed step {step}" if step else "completed mission step"
+    if event == "mission.qa.started":
+        return "starting quality check"
+    if event == "mission.qa.review":
+        attempt = payload.get("attempt")
+        state = "passed" if payload.get("approved") else "checking for fixes"
+        return f"QA review #{attempt} {state}" if attempt else f"QA review {state}"
+    if event == "mission.qa.revision_required":
+        return "applying revision requested by QA"
+    if event == "mission.qa.revision_started":
+        step = payload.get("step")
+        return f"working on revision step {step}" if step else "working on revision"
+    if event == "mission.qa.revision_completed":
+        return "revision complete"
+    if event == "mission.approved":
+        return "mission complete"
+    if event == "mission.failed":
+        return "mission failed"
+    if event == "mission.cancel_requested":
+        return "mission cancelled"
+    return None
+
+
 def _maybe_register_status_hooks() -> None:
     """
     Register hook handlers that can narrate tool/cheatcode progress in Discord.
@@ -138,10 +175,37 @@ def _maybe_register_status_hooks() -> None:
     _status_hook_registered = True
 
     try:
-        from core.hooks import on_pre_cheatcode_execute
+        from core.hooks import on_orchestration_status, on_pre_cheatcode_execute
     except Exception:
         logger.debug("Cheatcode hooks unavailable; skipping discord status hook registration")
         return
+
+    @on_orchestration_status(priority=35)
+    def _discord_status_on_mission(run, event: str, payload: Dict[str, Any], context=None):
+        ctrl = get_controller()
+        if ctrl is None:
+            return
+        ctx = get_active_context() or {}
+        ch = ctx.get("channel")
+        if ch is None:
+            return
+
+        activity = _status_activity_for_mission(event, payload or {})
+        if not activity:
+            return
+
+        terminal_events = {
+            "mission.approved",
+            "mission.failed",
+            "mission.cancel_requested",
+        }
+        if event in terminal_events:
+            clear_fn = getattr(ctrl, "_status_clear", None)
+            if callable(clear_fn):
+                _schedule_coro(clear_fn(ch))
+            return
+
+        _schedule_coro(ctrl.post_status(ch, activity))
 
     @on_pre_cheatcode_execute(priority=40)
     def _discord_status_on_cheatcode(namespace: str, action: str, attributes: Dict[str, Any], context=None):
