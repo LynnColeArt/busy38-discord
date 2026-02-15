@@ -61,6 +61,7 @@ Before submitting generated changes, verify:
 - Changes do not introduce silent fallbacks or remove validation/security paths.
 - Behavior changes are documented where needed (plugin docs, release notes, or API references).
 - Failure states are telemetry and should remain visible; do not introduce graceful-fallback behavior that hides runtime failures.
+- Do not merge substantial architectural changes without a tracked issue number or an associated public forum thread.
 - All relevant tests pass before merge.
 
 ## Requirements
