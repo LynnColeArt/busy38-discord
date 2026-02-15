@@ -51,6 +51,7 @@ For production code, placeholders are not acceptable.
 
 - Unit tests may use mocks and stubs.
 - Runtime code must be functional and complete when merged.
+- New functionality must include unit tests (or updates to existing tests) that cover the behavior.
 
 Before submitting generated changes, verify:
 
@@ -59,6 +60,7 @@ Before submitting generated changes, verify:
 - New behavior has tests or integration checks and explicit edge-case handling.
 - Changes do not introduce silent fallbacks or remove validation/security paths.
 - Behavior changes are documented where needed (plugin docs, release notes, or API references).
+- All relevant tests pass before merge.
 
 ## Requirements
 
