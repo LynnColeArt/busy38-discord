@@ -60,6 +60,7 @@ Before submitting generated changes, verify:
 - New behavior has tests or integration checks and explicit edge-case handling.
 - Changes do not introduce silent fallbacks or remove validation/security paths.
 - Behavior changes are documented where needed (plugin docs, release notes, or API references).
+- Failure states are telemetry and should remain visible; do not introduce graceful-fallback behavior that hides runtime failures.
 - All relevant tests pass before merge.
 
 ## Requirements
