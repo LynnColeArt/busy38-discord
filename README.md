@@ -45,7 +45,7 @@ See `API_REFERENCE.md` and `tool_spec.yaml`.
 
 ## AI-Generated / Automated Contributions
 
-Automated code generation and AI-assisted submissions are welcome.
+Automated and AI-assisted contributions are welcome, provided they meet the same production standards as human-written code.
 
 For production code, placeholders are not acceptable.
 
