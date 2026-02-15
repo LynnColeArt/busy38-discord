@@ -156,3 +156,94 @@ namespaces:
         parameters:
           thread_id: { type: integer, required: true }
           limit: { type: integer, required: false, default: 30 }
+
+  drelay:
+    description: Internal agent relay for shared room coordination without direct Discord permissions.
+    actions:
+      emit:
+        description: Emit a structured status/progress message into a relay room.
+        parameters:
+          room_id:
+            type: string
+            required: true
+            description: Shared room key, e.g. "discord:<guild_id>:<channel_id>"
+          agent_id:
+            type: string
+            required: true
+          message:
+            type: string
+            required: true
+          kind:
+            type: string
+            required: false
+            default: status
+            description: Event kind (status, progress, handoff, final, etc.)
+          visibility:
+            type: string
+            required: false
+            default: public
+            description: public, ops, or private
+          run_id:
+            type: string
+            required: false
+            description: Optional workflow correlation id
+          correlation_id:
+            type: string
+            required: false
+            description: Optional parent/event correlation id
+          metadata:
+            type: object
+            required: false
+            description: Optional structured, non-sensitive payload
+        returns:
+          type: object
+          properties:
+            success: { type: boolean }
+            event_id: { type: string }
+            room_id: { type: string }
+            visibility: { type: string }
+      read:
+        description: Read relay events for one room.
+        parameters:
+          room_id:
+            type: string
+            required: true
+          visibility:
+            type: string
+            required: false
+            default: public
+            description: public, ops, private, or any
+          kinds:
+            type: string
+            required: false
+            description: Comma-separated kind values
+          limit:
+            type: integer
+            required: false
+            default: 20
+          since_event_id:
+            type: string
+            required: false
+            description: Return only events after this id
+        returns:
+          type: object
+          properties:
+            success: { type: boolean }
+            room_id: { type: string }
+            visibility: { type: string }
+            count: { type: integer }
+            events: { type: array, items: { type: object } }
+      status:
+        description: Return room backlog counts.
+        parameters:
+          room_id:
+            type: string
+            required: false
+            description: Optional room id, returns one-room summary when provided, all rooms when omitted
+        returns:
+          type: object
+          properties:
+            success: { type: boolean }
+            room: { type: string }
+            count: { type: integer }
+            rooms: { type: object }

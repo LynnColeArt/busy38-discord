@@ -177,7 +177,71 @@ Fetch recent messages and applied tags:
 
 Returns each message with `attachments` metadata when present.
 
+## Namespace: `drelay`
+
+Internal multi-agent relay for private/shared room status channels. This is designed for
+multiple worker bots that cannot all hold Discord posting permissions but still need one shared
+coordination plane.
+
+### `drelay:emit`
+
+Write a structured event into a room bus.
+
+```text
+[drelay:emit room_id="discord:123:456" agent_id="nora" kind="status" message="I validated the patch and queued review." visibility="public" /]
+```
+
+Example (tool-call style):
+```text
+[drelay:emit room_id="discord:123:456" agent_id="alex" kind="handoff" message="I finished scanning open issues." visibility="ops" metadata='{"run_id":"abc123","correlation_id":"r1"}' /]
+```
+
+Parameters:
+- `room_id` (string, required): shared room key (for example `discord:<guild_id>:<channel_id>`)
+- `agent_id` (string, required): caller identity
+- `message` (string, required): short event content
+- `kind` (string, optional): status, progress, handoff, final, etc. (default `status`)
+- `visibility` (string, optional): `public`, `ops`, `private` (default `public`)
+- `run_id` (string, optional): optional mission/workflow correlation id
+- `correlation_id` (string, optional): optional parent event/message id
+- `metadata` (map, optional): structured, non-sensitive metadata (max-size policy is enforced by caller)
+
+Returns:
+- `{success: true, event_id: "...", room_id: "...", visibility: "public"}`
+
+### `drelay:read`
+
+Read events from a room.
+
+```text
+[drelay:read room_id="discord:123:456" visibility="public" kinds="status,handoff" limit=20 /]
+```
+
+Parameters:
+- `room_id` (string, required)
+- `visibility` (string, optional): filter by visibility (`public`, `ops`, `private`, `any`)
+- `kinds` (string, optional): comma-separated kind list
+- `limit` (int, optional): max events returned (1-200)
+- `since_event_id` (string, optional): return events after this event id
+
+Returns:
+- `{success: true, room_id: "...", visibility: "...", count: N, events: [...]}` where each event has
+  `event_id, ts, room_id, agent_id, kind, visibility, message, metadata, run_id, correlation_id, actor`.
+
+### `drelay:status`
+
+Check relay backlog sizes.
+
+```text
+[drelay:status /]
+[drelay:status room_id="discord:123:456" /]
+```
+
+Returns:
+- all-room summary when no `room_id`, otherwise per-room count.
+
 ## Security Notes
 
 - `dlog:*` reads local chat logs only; it does not fetch from Discord.
 - `dforum:*` uses Discord APIs and should be treated as a privileged capability.
+- `drelay:*` is persisted in local JSONL under `BUSY38_CHATLOG_DIR` and does not post to Discord itself; use visibility settings to scope sharing.

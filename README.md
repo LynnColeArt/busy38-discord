@@ -34,6 +34,10 @@ The plugin registers these cheatcode namespaces in Busy38’s cheatcode registry
 - `dlog:*`: search Busy38’s Discord transcript DB (broad search with snippets, then drill-down context)
 - `dforum:*`: async operations for forum threads (reply, rename, tag, archive/lock, create posts)
   - `reply` and `create_post` support attachments from local paths, URLs, base64 payloads, or data URIs
+- `drelay:*`: agent relay bus for coordinated multi-agent workflows without direct Discord channel permissions
+  - `emit` posts structured room-scoped updates
+  - `read` retrieves recent room context and status updates
+  - `status` returns per-room backlog counts
 
 See `API_REFERENCE.md` and `tool_spec.yaml`.
 
@@ -73,6 +77,8 @@ See `API_REFERENCE.md` and `tool_spec.yaml`.
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE`: attempt text previews for small text-like files (default `1`)
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES`: max inbound file size for preview extraction (default `65536`)
 - `DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS`: max preview characters saved per attachment (default `1200`)
+- `DISCORD_RELAY_ROOM_MAX_EVENTS`: per-room relay backlog cap (default `200`)
+- `DISCORD_RELAY_GLOBAL_MAX_EVENTS`: global relay backlog cap across all rooms (default `5000`)
 - `DISCORD_STATUS_ENABLE`: enable action-style status messages during work (default `0`)
 - `DISCORD_STATUS_MODE`: `edit` (single message updated) or `message` (new message per update) (default `edit`)
 - `DISCORD_STATUS_STYLE`: `implicit` (like `/me`, do not repeat bot name in message body) or `explicit` (include name) (default `implicit`)

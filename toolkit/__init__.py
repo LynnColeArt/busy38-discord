@@ -12,9 +12,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 import os
 import logging
+import json
+import threading
+import time
+import uuid
 
 from core.cheatcodes.registry import register_namespace
 from .discord_transcript import DiscordTranscriptLogger
@@ -121,6 +126,12 @@ def _status_activity_for_cheatcode(namespace: str, action: str, attributes: Dict
             return "locking a thread"
         if act == "get_thread":
             return "reviewing a thread"
+
+    if ns == "drelay":
+        if act == "emit":
+            return "broadcasting an agent status update"
+        if act == "read":
+            return "checking relay room messages"
 
     return None
 
@@ -287,6 +298,214 @@ class _DiscordLogHandler:
         return {"success": True, "rows": rows}
 
 
+@dataclass
+class _DiscordRelayStore:
+    data_dir: str = "./data/memory"
+    room_max_events: int = 200
+    global_max_events: int = 5000
+
+    def __post_init__(self) -> None:
+        relay_dir = Path(self.data_dir)
+        relay_dir.mkdir(parents=True, exist_ok=True)
+        self._path = relay_dir / "discord_agent_relay.jsonl"
+        self._lock = threading.Lock()
+        self._room_max_events = max(10, int(os.getenv("DISCORD_RELAY_ROOM_MAX_EVENTS", str(self.room_max_events))))
+        self._global_max_events = max(self._room_max_events, int(os.getenv("DISCORD_RELAY_GLOBAL_MAX_EVENTS", str(self.global_max_events))))
+
+    def _iter_events(self) -> Iterable[Dict[str, Any]]:
+        if not self._path.exists():
+            return []
+        with self._path.open("r", encoding="utf-8") as fp:
+            for raw in fp:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    logger.warning("Skipping malformed relay bus line in %s", self._path)
+                    continue
+                if isinstance(event, dict):
+                    yield event
+
+    def _load_events(self) -> Dict[str, list]:
+        events_by_room: Dict[str, list] = {}
+        for event in self._iter_events():
+            room_id = str(event.get("room_id") or "").strip()
+            if not room_id:
+                continue
+            events_by_room.setdefault(room_id, []).append(event)
+        return events_by_room
+
+    def _sort_and_prune(self, events_by_room: Dict[str, list]) -> Dict[str, list]:
+        by_room: Dict[str, list] = {}
+        all_events = []
+        for room_id, rows in events_by_room.items():
+            rows.sort(key=lambda item: int(item.get("ts_epoch", 0)))
+            keep_rows = rows[-self._room_max_events :]
+            by_room[room_id] = keep_rows
+            all_events.extend(keep_rows)
+
+        if len(all_events) <= self._global_max_events:
+            return by_room
+
+        all_events.sort(key=lambda item: int(item.get("ts_epoch", 0)))
+        all_events = all_events[-self._global_max_events :]
+        keep_global_ids = {str(item.get("event_id")) for item in all_events}
+        for room_id, rows in by_room.items():
+            by_room[room_id] = [r for r in rows if str(r.get("event_id")) in keep_global_ids]
+        return by_room
+
+    def _write_events(self, events_by_room: Dict[str, list]) -> None:
+        tmp = self._path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fp:
+            for rows in events_by_room.values():
+                for event in rows:
+                    fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+        tmp.replace(self._path)
+
+    def append_event(self, *, room_id: str, agent_id: str, kind: str, message: str, visibility: str, metadata: Optional[Dict[str, Any]] = None, run_id: Optional[str] = None, correlation_id: Optional[str] = None, actor: Optional[str] = None) -> Dict[str, Any]:
+        room = room_id.strip()
+        if not room:
+            return {"success": False, "error": "room_id is required"}
+
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts_epoch": int(time.time()),
+            "room_id": room,
+            "agent_id": str(agent_id or "unknown").strip()[:80],
+            "kind": str(kind or "status").strip()[:40],
+            "message": str(message or "").strip(),
+            "visibility": str(visibility or "public").strip().lower(),
+            "metadata": dict(metadata or {}),
+            "run_id": run_id,
+            "correlation_id": correlation_id,
+            "actor": str(actor or "discord_plugin").strip(),
+        }
+
+        with self._lock:
+            events_by_room = self._load_events()
+            events_by_room.setdefault(room, []).append(event)
+            events_by_room = self._sort_and_prune(events_by_room)
+            self._write_events(events_by_room)
+
+        return {"success": True, "event_id": event["event_id"], "room_id": room, "visibility": event["visibility"]}
+
+    def read_events(self, *, room_id: str, visibility: str = "public", kinds: Optional[str] = None, limit: int = 20, since_event_id: Optional[str] = None) -> Dict[str, Any]:
+        requested_vis = str(visibility or "public").strip().lower()
+        kind_filter = set(part.strip().lower() for part in str(kinds or "").split(",") if part.strip())
+
+        events_by_room = self._sort_and_prune(self._load_events())
+        rows = events_by_room.get(room_id.strip(), [])
+        out: list = []
+        seen = False
+
+        for event in rows:
+            event_visibility = str(event.get("visibility", "public"))
+            if event_visibility != requested_vis and requested_vis != "any":
+                continue
+            if kind_filter:
+                if str(event.get("kind", "")).strip().lower() not in kind_filter:
+                    continue
+            if since_event_id and not seen:
+                if str(event.get("event_id")) == str(since_event_id):
+                    seen = True
+                continue
+            out.append(event)
+
+        out.sort(key=lambda item: int(item.get("ts_epoch", 0)), reverse=True)
+        limit = max(1, min(200, int(limit)))
+        out = out[:limit]
+        return {"success": True, "room_id": room_id, "visibility": requested_vis, "count": len(out), "events": out}
+
+
+class _DiscordRelayHandler:
+    def __init__(self):
+        self._store = _DiscordRelayStore(data_dir=os.getenv("BUSY38_CHATLOG_DIR", "./data/memory"))
+
+    def execute(self, action: str, **kwargs: Any) -> Dict[str, Any]:
+        action_map = {
+            "emit": self._emit,
+            "read": self._read,
+            "status": self._status,
+        }
+        fn = action_map.get(action)
+        if not fn:
+            return {"success": False, "error": f"Unknown action: {action}"}
+        return fn(**kwargs)
+
+    def _normalize_room(self, room_id: str) -> str:
+        return str(room_id or "").strip()
+
+    def _emit(
+        self,
+        room_id: str,
+        agent_id: str,
+        message: str,
+        kind: str = "status",
+        visibility: str = "public",
+        metadata: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        room = self._normalize_room(room_id)
+        if not room:
+            return {"success": False, "error": "room_id is required"}
+        clean_kind = str(kind or "status").strip().lower()
+        clean_visibility = str(visibility or "public").strip().lower()
+        if clean_visibility not in {"public", "ops", "private", "any"}:
+            return {"success": False, "error": f"invalid visibility: {visibility}"}
+        if len(str(message or "")) > 3000:
+            return {"success": False, "error": "message too long (max 3000)"}
+        return self._store.append_event(
+            room_id=room,
+            agent_id=agent_id,
+            kind=clean_kind,
+            message=str(message or ""),
+            visibility=clean_visibility if clean_visibility != "any" else "public",
+            metadata=metadata,
+            run_id=run_id,
+            correlation_id=correlation_id,
+            actor=actor,
+        )
+
+    def _read(
+        self,
+        room_id: str,
+        visibility: str = "public",
+        kinds: Optional[str] = None,
+        limit: int = 20,
+        since_event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        room = self._normalize_room(room_id)
+        if not room:
+            return {"success": False, "error": "room_id is required"}
+        if int(limit) <= 0:
+            return {"success": False, "error": "limit must be > 0"}
+        return self._store.read_events(
+            room_id=room,
+            visibility=visibility,
+            kinds=kinds,
+            limit=int(limit),
+            since_event_id=since_event_id,
+        )
+
+    def _status(self, room_id: Optional[str] = None) -> Dict[str, Any]:
+        room = self._normalize_room(room_id or "all")
+        all_events = self._store._load_events()
+        if room == "all":
+            count = sum(len(events) for events in all_events.values())
+            rooms = {key: len(events) for key, events in all_events.items()}
+            return {"success": True, "room": "all", "rooms": rooms, "count": count}
+        return {
+            "success": True,
+            "room": room,
+            "count": len(all_events.get(room, [])),
+        }
+
+
 class Toolkit:
     """Vendor plugin entry point (auto-instantiated by PluginManager)."""
 
@@ -294,6 +513,7 @@ class Toolkit:
         data_dir = os.getenv("BUSY38_CHATLOG_DIR", "./data/memory")
         register_namespace("dlog", _DiscordLogHandler(data_dir=data_dir))
         register_namespace("dforum", _DiscordForumHandler())
+        register_namespace("drelay", _DiscordRelayHandler())
         _maybe_register_heartbeat_jobs()
         _maybe_register_status_hooks()
 
