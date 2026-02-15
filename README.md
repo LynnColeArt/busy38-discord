@@ -5,6 +5,8 @@ Busy38 vendor plugin that provides the full Discord transport surface:
 - Discord state/transcript/runtime bridge modules
 - Agent cheatcodes for transcript search and forum task-board operations
 
+Roadmap note: full internal rebrand Phase 2 is deferred until after closed-beta hardening is complete.
+
 This plugin is intended to be **vendored into Busy38** under `./vendor/busy-38-discord/` and loaded by Busy38’s `PluginManager`.
 
 ## What It Adds
