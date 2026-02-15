@@ -43,6 +43,23 @@ The plugin registers these cheatcode namespaces in Busy38’s cheatcode registry
 
 See `API_REFERENCE.md` and `tool_spec.yaml`.
 
+## AI-Generated / Automated Contributions
+
+Automated code generation and AI-assisted submissions are welcome.
+
+For production code, placeholders are not acceptable.
+
+- Unit tests may use mocks and stubs.
+- Runtime code must be functional and complete when merged.
+
+Before submitting generated changes, verify:
+
+- No functional file includes temporary placeholders (`TODO`, `FIXME`, `NotImplementedError`).
+- Mock/stub logic is confined to tests and fixtures.
+- New behavior has tests or integration checks and explicit edge-case handling.
+- Changes do not introduce silent fallbacks or remove validation/security paths.
+- Behavior changes are documented where needed (plugin docs, release notes, or API references).
+
 ## Requirements
 
 - Busy38 host runtime (this plugin imports Busy38’s cheatcode registry).
