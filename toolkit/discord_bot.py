@@ -76,6 +76,18 @@ logger = logging.getLogger(__name__)
 
 class Busy38DiscordBot:
     """Discord bot that routes messages to Busy38 agents."""
+
+    _KNOWN_ROUTE_ALIAS_MAP = {
+        "main": "main",
+        "orchestrator": "main",
+        "nora": "nora",
+        "alex": "alex",
+        "captain": "nora",
+        "captainhook": "nora",
+    }
+    _KNOWN_ROUTE_TARGETS = ("main", "nora", "alex")
+    _HEY_ROUTE_RE = re.compile(r"(?i)^\s*hey\s+([a-z][a-z0-9._-]{0,31})(?:\s*[:,;\\-]?\s+|\\s+$)(.*)$")
+    _AT_ROUTE_RE = re.compile(r"(?i)^\s*@([a-z][a-z0-9._-]{0,31})(?:\s*[:,;\\-]?\s+|\\s+$)(.*)$")
     
     def __init__(self, 
                  token: Optional[str] = None, 
@@ -143,6 +155,7 @@ class Busy38DiscordBot:
         # Per-channel serialization and throttling (avoid overlapping LLM calls)
         self._channel_locks: dict[int, asyncio.Lock] = {}
         self._last_invoke_unix: dict[int, float] = {}
+        self._last_target_by_channel: dict[str, str] = {}
         self._min_invoke_interval = float(os.getenv("DISCORD_MIN_INVOKE_INTERVAL_SEC", "6.0"))
 
         # Optional "silent acknowledgement" reactions for no-response outcomes.
@@ -213,6 +226,7 @@ class Busy38DiscordBot:
         self._status_min_interval_sec = max(0.2, float(os.getenv("DISCORD_STATUS_MIN_INTERVAL_SEC", "2.5")))
         self._status_delete_on_finish = self._truthy_env("DISCORD_STATUS_DELETE_ON_FINISH", default="1")
         self._status_include_args = self._truthy_env("DISCORD_STATUS_INCLUDE_ARGS", default="0")
+        self._status_events_enable = self._truthy_env("DISCORD_STATUS_EVENT_FEEDBACK", default="1")
         self._status_msg_by_channel: Dict[int, Any] = {}
         self._status_last_update_unix: Dict[int, float] = {}
         
@@ -231,6 +245,67 @@ class Busy38DiscordBot:
             if e:
                 out.append(e)
         return out
+
+    @classmethod
+    def _known_route_targets(cls) -> List[str]:
+        return list(cls._KNOWN_ROUTE_TARGETS)
+
+    @staticmethod
+    def _normalize_route_alias(raw: Optional[str]) -> str:
+        if not raw:
+            return ""
+        return re.sub(r"[^a-z0-9._-]", "", str(raw).lower().strip())
+
+    @classmethod
+    def _parse_explicit_route(cls, content: str) -> tuple[Optional[str], str]:
+        raw = (content or "").strip()
+        if not raw:
+            return None, raw
+        m = cls._HEY_ROUTE_RE.match(raw)
+        if m:
+            alias = (m.group(1) or "").strip()
+            message = (m.group(2) or "").strip()
+            return alias, message
+        m = cls._AT_ROUTE_RE.match(raw)
+        if m:
+            alias = (m.group(1) or "").strip()
+            message = (m.group(2) or "").strip()
+            return alias, message
+        return None, raw
+
+    @classmethod
+    def _resolve_explicit_route_target(cls, raw_alias: Optional[str]) -> tuple[Optional[str], bool]:
+        alias = cls._normalize_route_alias(raw_alias)
+        if not alias:
+            return None, False
+        mapped = cls._KNOWN_ROUTE_ALIAS_MAP.get(alias)
+        if mapped:
+            return mapped, True
+        return None, False
+
+    @staticmethod
+    def _format_routing_context(
+        *,
+        routing_mode: str,
+        route_source: str,
+        target_agent_id: Optional[str],
+        recipients: Optional[List[str]] = None,
+        known_agents: Optional[List[str]] = None,
+    ) -> str:
+        lines = [
+            "Routing context:",
+            f"- mode: {routing_mode}",
+            f"- route_source: {route_source}",
+        ]
+        if target_agent_id:
+            lines.append(f"- explicit_target: {target_agent_id}")
+        if recipients:
+            lines.append("- recipients: " + ",".join(recipients))
+        if known_agents:
+            lines.append("- known_agents: " + ",".join(known_agents))
+        if routing_mode == "direct" and not target_agent_id:
+            lines.append("- explicit_target_missing: true")
+        return "\n".join(lines)
 
     @staticmethod
     def _coordination_hints(*, content: str, self_id: int, mentioned_ids: List[int], mentioned_bot_ids: List[int]) -> Dict[str, Any]:
@@ -660,7 +735,16 @@ class Busy38DiscordBot:
             self._channel_locks[channel_id] = lock
         return lock
 
-    def _should_invoke_agent(self, *, key: ChannelKey, is_dm: bool, is_mentioned: bool, is_reply_to_me: bool, content: str) -> bool:
+    def _should_invoke_agent(
+        self,
+        *,
+        key: ChannelKey,
+        is_dm: bool,
+        is_mentioned: bool,
+        is_reply_to_me: bool,
+        content: str,
+        explicit_route: Optional[str] = None,
+    ) -> bool:
         """
         Decide whether to call the LLM.
 
@@ -675,6 +759,8 @@ class Busy38DiscordBot:
         cfg = self.state.channel_config(key)
 
         if is_dm:
+            return True
+        if explicit_route:
             return True
         if is_mentioned or is_reply_to_me or wakeword:
             return True
@@ -697,6 +783,7 @@ class Busy38DiscordBot:
             "You can see recent channel history and should behave like a normal participant.\n"
             "If no response is needed, output exactly: [no-response /]\n"
             "Optional: include [react:EMOJI] to react to the triggering message when staying silent.\n\n"
+            f"Known routing targets: {', '.join(self._known_route_targets())}\n"
             f"Context:\n"
             f"- guild: {guild_name or 'DM'}\n"
             f"- channel: {channel_name} (id={key.channel_id})\n"
@@ -821,6 +908,47 @@ class Busy38DiscordBot:
         if a.lower().startswith(("is ", "are ")):
             return f"*{a}…*"
         return f"*is {a}…*"
+
+    @staticmethod
+    def _format_tool_status_line(event: str, payload: Dict[str, Any]) -> str:
+        e = str(event or "").strip().lower()
+        meta = payload.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        owner = str(payload.get("owner") or meta.get("owner") or "agent")
+        tool = str(payload.get("tool_text") or payload.get("tool") or meta.get("tool") or "").strip()
+        tool_name = tool or "tool request"
+        reason = str(payload.get("reason") or meta.get("reason") or "").strip()
+        err = str(payload.get("error") or meta.get("error") or "").strip()
+
+        if e == "tool.requested":
+            return f"🛠️ {owner} requested tool: {tool_name}"
+        if e == "tool.started":
+            return f"🛠️ {owner} started tool: {tool_name}"
+        if e == "tool.completed":
+            return f"✅ {owner} completed tool: {tool_name}"
+        if e == "tool.failed":
+            detail = reason or err
+            if detail:
+                return f"⚠️ {owner} tool failed: {tool_name} ({detail})"
+            return f"⚠️ {owner} tool failed: {tool_name}"
+        if e == "tool.refused":
+            detail = reason
+            if detail:
+                return f"🚫 {owner} refused tool: {tool_name} ({detail})"
+            return f"🚫 {owner} refused tool: {tool_name}"
+        return ""
+
+    async def _post_tool_status(self, channel: Any, event: str, payload: Dict[str, Any]) -> None:
+        if not self._status_events_enable:
+            return
+        line = self._format_tool_status_line(event, payload)
+        if not line:
+            return
+        try:
+            await channel.send(line)
+        except Exception:
+            logger.debug("Failed to post Discord tool status event", exc_info=True)
 
     async def _status_set(self, channel: Any, activity: str, *, force: bool = False) -> None:
         if not self._status_enable:
@@ -1032,7 +1160,7 @@ class Busy38DiscordBot:
                 return True
             return False
 
-        async def _invoke_agent_for_message(
+    async def _invoke_agent_for_message(
             message,
             content: str,
             *,
@@ -1040,6 +1168,8 @@ class Busy38DiscordBot:
             is_mentioned: bool,
             trigger_override: Optional[str] = None,
             coordination: Optional[Dict[str, Any]] = None,
+            route_mode: str = "auto",
+            route_target: Optional[str] = None,
         ) -> Optional[str]:
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
@@ -1051,22 +1181,39 @@ class Busy38DiscordBot:
 
             # If not explicitly mentioned, give agent a strong prior to be silent unless needed.
             trigger = trigger_override or ("mention" if is_mentioned else ("dm" if is_dm else "follow"))
-            user_task = (
-                f"Trigger: {trigger}\n"
-                f"Coordination: assignment={bool(coord.get('has_assignment'))}, handoff={bool(coord.get('has_handoff'))}, "
-                f"mentions_self={bool(coord.get('mentions_self'))}, "
-                f"assigned_to_self={bool(coord.get('explicit_assignment_to_self'))}, "
-                f"assigned_to_other={bool(coord.get('explicit_assignment_to_other'))}, "
-                f"handoff_to_self={bool(coord.get('handoff_to_self'))}, "
-                f"handoff_to_other={bool(coord.get('handoff_to_other'))}, "
-                f"other_agent_ids={','.join(str(x) for x in mentioned_other_agents) or 'none'}\n"
-                f"New message from {message.author} ({message.author.id}):\n"
-                f"{content}\n\n"
-                "Respond as Busy38 in this Discord channel, or output [no-response /] if you should stay silent."
+            routing_context = self._format_routing_context(
+                routing_mode=route_mode,
+                route_source="discord",
+                target_agent_id=route_target,
+                recipients=[route_target] if route_target else None,
+                known_agents=self._known_route_targets(),
             )
+        user_task = (
+            f"Trigger: {trigger}\n"
+            f"{routing_context}\n"
+            f"Coordination: assignment={bool(coord.get('has_assignment'))}, handoff={bool(coord.get('has_handoff'))}, "
+            f"mentions_self={bool(coord.get('mentions_self'))}, "
+            f"assigned_to_self={bool(coord.get('explicit_assignment_to_self'))}, "
+            f"assigned_to_other={bool(coord.get('explicit_assignment_to_other'))}, "
+            f"handoff_to_self={bool(coord.get('handoff_to_self'))}, "
+            f"handoff_to_other={bool(coord.get('handoff_to_other'))}, "
+            f"other_agent_ids={','.join(str(x) for x in mentioned_other_agents) or 'none'}\n"
+            f"New message from {message.author} ({message.author.id}):\n"
+            f"{content}\n\n"
+            "Respond as Busy38 in this Discord channel, or output [no-response /] if you should stay silent."
+        )
 
-            ctx_messages = self._build_context_messages(key=key, system_prompt=sys_prompt, user_task=user_task)
-            return await self.orchestrator.run_agent_loop(task=user_task, context=ctx_messages)
+        async def _orchestration_status_update(context: Dict[str, Any], event: str, payload: Dict[str, Any]) -> None:
+            if not str(event).startswith("tool."):
+                return
+            await self._post_tool_status(message.channel, event, payload)
+
+        ctx_messages = self._build_context_messages(key=key, system_prompt=sys_prompt, user_task=user_task)
+        return await self.orchestrator.run_agent_loop(
+            task=user_task,
+            context=ctx_messages,
+            status_callback=_orchestration_status_update,
+        )
         
         @self.bot.event
         async def on_message(message):
@@ -1124,6 +1271,24 @@ class Busy38DiscordBot:
                 content = content.replace(f"<@{self.bot.user.id}>", "").strip()
                 content = content.replace(f"<@!{self.bot.user.id}>", "").strip()
 
+            explicit_alias, routed_content = self._parse_explicit_route(content)
+            route_target: Optional[str] = None
+            if explicit_alias:
+                resolved_target, alias_ok = self._resolve_explicit_route_target(explicit_alias)
+                if not alias_ok:
+                    await message.channel.send(
+                        "I couldn't resolve that route. Try 'hey nora', 'hey alex', or 'hey main'. "
+                        "Say it as the first words of your message."
+                    )
+                    return
+                content = routed_content
+                route_target = resolved_target
+            elif not route_target:
+                # Last-speaker fallback for follow-up routing.
+                gid = message.guild.id if getattr(message, "guild", None) else None
+                key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
+                route_target = self._last_target_by_channel.get(key.as_str())
+
             # Wakeword prefixes (treat like an implicit mention)
             lowered = (content or "").lstrip().lower()
             if lowered.startswith("busy38:"):
@@ -1167,12 +1332,16 @@ class Busy38DiscordBot:
 
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
+            route_mode = "fallback" if route_target else "auto"
+            if explicit_alias:
+                route_mode = "direct"
             should_invoke = self._should_invoke_agent(
                 key=key,
                 is_dm=is_dm,
                 is_mentioned=is_mentioned,
                 is_reply_to_me=is_reply_to_me,
                 content=content,
+                explicit_route=route_target,
             )
             if is_new_forum_task:
                 should_invoke = True
@@ -1237,11 +1406,16 @@ class Busy38DiscordBot:
                                 is_mentioned=is_mentioned or is_reply_to_me,
                                 trigger_override="forum_task" if is_new_forum_task else None,
                                 coordination=coordination,
+                                route_mode=route_mode,
+                                route_target=route_target,
                             )
 
                         if status_task:
                             status_task.cancel()
                         await self._status_clear(message.channel)
+
+                    if route_target:
+                        self._last_target_by_channel[key.as_str()] = route_target
 
                     # True silence: the agent can emit [no-response /], optional [react:EMOJI].
                     is_silent, requested_reaction = self._parse_no_response_directives(result)
