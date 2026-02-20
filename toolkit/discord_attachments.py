@@ -13,42 +13,25 @@ import os
 import re
 import shlex
 from pathlib import Path
+import hashlib
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple
+
+from core.attachments.intake import (
+    ATTACHMENT_DECISION_ACCEPT,
+    ATTACHMENT_DECISION_BLOCK,
+    ATTACHMENT_DECISION_QUARANTINE,
+    extract_attachment_text_preview,
+    _assess_attachment_intake,
+    attachment_summary_line,
+    sanitize_attachment_for_transcript,
+)
 
 try:
     import discord
 except Exception:  # pragma: no cover
     discord = None
 
-
-_TEXT_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".markdown",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".csv",
-    ".tsv",
-    ".py",
-    ".js",
-    ".ts",
-    ".java",
-    ".go",
-    ".rs",
-    ".c",
-    ".cpp",
-    ".h",
-    ".sql",
-    ".xml",
-    ".html",
-    ".css",
-    ".log",
-}
 
 _ATTACH_TAG_RE = re.compile(r"\[\s*attach\s+([^\]]*?)\/\s*\]", re.IGNORECASE)
 _ATTACH_INLINE_RE = re.compile(r"\[\s*attach\s*:\s*([^\]]+)\]", re.IGNORECASE)
@@ -126,14 +109,8 @@ def _decode_base64_payload(raw_value: str) -> Tuple[Optional[bytes], Optional[st
     return data, None
 
 
-def _is_text_like_attachment(filename: str, content_type: Optional[str]) -> bool:
-    ct = (content_type or "").lower()
-    if ct.startswith("text/"):
-        return True
-    if ct in ("application/json", "application/xml", "application/yaml", "application/x-yaml"):
-        return True
-    suffix = Path(filename or "").suffix.lower()
-    return suffix in _TEXT_EXTENSIONS
+def _should_preview_with_ocr() -> bool:
+    return _truthy_env("DISCORD_ATTACHMENT_OCR_PREVIEW", "1")
 
 
 def normalize_attachment_specs(attachments: Any) -> List[Dict[str, Any]]:
@@ -460,23 +437,6 @@ def close_discord_files(files: List[Any]) -> None:
             pass
 
 
-def attachment_summary_line(attachments: List[Dict[str, Any]], *, max_items: int = 4) -> str:
-    if not attachments:
-        return ""
-    parts: List[str] = []
-    for att in attachments[:max_items]:
-        name = att.get("filename") or "file"
-        size = att.get("size")
-        if isinstance(size, int):
-            parts.append(f"{name} ({size}B)")
-        else:
-            parts.append(str(name))
-    more = len(attachments) - len(parts)
-    if more > 0:
-        parts.append(f"+{more} more")
-    return "[attachments] " + ", ".join(parts)
-
-
 async def extract_message_attachments(
     message: Any,
     *,
@@ -511,21 +471,23 @@ async def extract_message_attachments(
             "width": getattr(att, "width", None),
         }
 
-        if include_preview and size > 0 and size <= max_preview_bytes and _is_text_like_attachment(filename, content_type):
+        if include_preview and size > 0 and size <= max_preview_bytes:
             try:
                 raw = await att.read()
                 if isinstance(raw, bytes) and raw:
-                    text = raw.decode("utf-8", errors="replace")
-                    text = text.replace("\x00", "").strip()
-                    if len(text) > max_preview_chars:
-                        if max_preview_chars <= 3:
-                            text = text[:max_preview_chars]
-                        else:
-                            text = text[: max_preview_chars - 3] + "..."
+                    entry["text_hash"] = hashlib.sha256(raw).hexdigest()
+                    text = extract_attachment_text_preview(
+                        data=raw,
+                        filename=filename,
+                        content_type=content_type,
+                        max_chars=max_preview_chars,
+                        enable_ocr=_should_preview_with_ocr(),
+                    )
                     if text:
                         entry["text_preview"] = text
             except Exception:
                 pass
 
+        _assess_attachment_intake(entry)
         out.append(entry)
     return out
