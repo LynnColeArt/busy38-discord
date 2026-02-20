@@ -910,7 +910,166 @@ class Busy38DiscordBot:
         return f"*is {a}…*"
 
     @staticmethod
-    def _format_tool_status_line(event: str, payload: Dict[str, Any]) -> str:
+    def _coerce_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_str(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _as_dict(raw: Any) -> Dict[str, Any]:
+        return raw if isinstance(raw, dict) else {}
+
+    def _extract_context_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = self._as_dict(payload.get("metadata"))
+        context_contract = self._as_dict(payload.get("context_contract"))
+        context_payload = self._as_dict(payload.get("context_payload"))
+        metadata_context_payload = self._as_dict(metadata.get("context_payload"))
+        metadata_contract = self._as_dict(metadata.get("context_contract"))
+        nested_contract = self._as_dict(context_payload.get("context_contract"))
+        nested_metadata_contract = self._as_dict(metadata_context_payload.get("context_contract"))
+
+        candidates = [
+            payload,
+            context_payload,
+            metadata_context_payload,
+            context_contract,
+            metadata_contract,
+            nested_contract,
+            nested_metadata_contract,
+            metadata,
+        ]
+
+        schema_version = None
+        budget_tokens = None
+        budget_usage_tokens = None
+        agent_profile_version = None
+        context_source = None
+        compat_mode = None
+        provenance = None
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if schema_version is None:
+                schema_version = self._coerce_int(candidate.get("context_schema_version"))
+            if budget_tokens is None:
+                budget_tokens = self._coerce_int(candidate.get("context_budget_tokens"))
+            if budget_usage_tokens is None:
+                budget_usage_tokens = self._coerce_int(candidate.get("budget_usage_tokens"))
+            if agent_profile_version is None:
+                agent_profile_version = self._coerce_int(candidate.get("agent_profile_version"))
+            if context_source is None:
+                context_source = self._coerce_str(candidate.get("context_source"))
+            if compat_mode is None:
+                compat_mode = self._coerce_str(candidate.get("context_contract_compat_mode"))
+            if provenance is None:
+                prov = candidate.get("provenance")
+                if isinstance(prov, dict):
+                    provenance = self._as_dict(prov)
+
+        used_legacy_payload = False
+        if isinstance(context_payload, dict) and isinstance(context_payload.get("context_contract"), dict):
+            inner_contract = self._as_dict(context_payload.get("context_contract"))
+            if inner_contract:
+                used_legacy_payload = True
+                if schema_version is None:
+                    schema_version = self._coerce_int(inner_contract.get("context_schema_version"))
+                if budget_tokens is None:
+                    budget_tokens = self._coerce_int(inner_contract.get("context_budget_tokens"))
+                if budget_usage_tokens is None:
+                    budget_usage_tokens = self._coerce_int(inner_contract.get("budget_usage_tokens"))
+                if agent_profile_version is None:
+                    agent_profile_version = self._coerce_int(inner_contract.get("agent_profile_version"))
+                if context_source is None:
+                    context_source = self._coerce_str(inner_contract.get("context_source"))
+                if provenance is None and isinstance(inner_contract.get("provenance"), dict):
+                    provenance = self._as_dict(inner_contract.get("provenance"))
+
+        if schema_version is None:
+            schema_version = 1
+
+        if not compat_mode:
+            has_contract_hints = any(
+                (
+                    source.get("context_schema_version") is not None
+                    or source.get("context_budget_tokens") is not None
+                    or source.get("budget_usage_tokens") is not None
+                    or source.get("agent_profile_version") is not None
+                    or source.get("context_source") is not None
+                )
+                for source in candidates
+                if isinstance(source, dict)
+            )
+            if has_contract_hints:
+                compat_mode = "legacy" if used_legacy_payload else "modern"
+            else:
+                compat_mode = "legacy"
+        else:
+            compat_mode = compat_mode.strip().lower()
+
+        normalized = {
+            "context_schema_version": schema_version,
+            "context_budget_tokens": budget_tokens,
+            "budget_usage_tokens": budget_usage_tokens,
+            "agent_profile_version": agent_profile_version,
+            "context_source": context_source,
+            "context_contract_compat_mode": compat_mode,
+            "provenance": provenance,
+        }
+        if context_contract:
+            normalized["context_contract"] = context_contract
+        if context_payload:
+            normalized["context_payload"] = context_payload
+        return {k: v for k, v in normalized.items() if v is not None and not (isinstance(v, dict) and not v)}
+
+    def _build_context_suffix(self, payload: Dict[str, Any]) -> str:
+        context = self._extract_context_metadata(payload)
+        source = self._coerce_str(context.get("context_source"))
+        schema = context.get("context_schema_version")
+        budget = context.get("context_budget_tokens")
+        usage = context.get("budget_usage_tokens")
+        mode = self._coerce_str(context.get("context_contract_compat_mode"))
+
+        suffix_parts: List[str] = []
+        if source:
+            suffix_parts.append(f"src={source}")
+        if schema is not None:
+            suffix_parts.append(f"schema={schema}")
+        if usage is not None or budget is not None:
+            if budget is not None:
+                suffix_parts.append(f"tokens={usage if usage is not None else 0}/{budget}")
+            else:
+                suffix_parts.append(f"usage={usage}")
+        if mode:
+            suffix_parts.append(f"mode={mode}")
+        if not suffix_parts:
+            return ""
+        return " [" + ", ".join(suffix_parts) + "]"
+
+    def _format_tool_status_line(self, event: str, payload: Dict[str, Any]) -> str:
         e = str(event or "").strip().lower()
         meta = payload.get("metadata")
         if not isinstance(meta, dict):
@@ -920,24 +1079,29 @@ class Busy38DiscordBot:
         tool_name = tool or "tool request"
         reason = str(payload.get("reason") or meta.get("reason") or "").strip()
         err = str(payload.get("error") or meta.get("error") or "").strip()
+        base = ""
 
         if e == "tool.requested":
-            return f"🛠️ {owner} requested tool: {tool_name}"
+            base = f"🛠️ {owner} requested tool: {tool_name}"
         if e == "tool.started":
-            return f"🛠️ {owner} started tool: {tool_name}"
+            base = f"🛠️ {owner} started tool: {tool_name}"
         if e == "tool.completed":
-            return f"✅ {owner} completed tool: {tool_name}"
+            base = f"✅ {owner} completed tool: {tool_name}"
         if e == "tool.failed":
             detail = reason or err
             if detail:
-                return f"⚠️ {owner} tool failed: {tool_name} ({detail})"
-            return f"⚠️ {owner} tool failed: {tool_name}"
+                base = f"⚠️ {owner} tool failed: {tool_name} ({detail})"
+            else:
+                base = f"⚠️ {owner} tool failed: {tool_name}"
         if e == "tool.refused":
             detail = reason
             if detail:
-                return f"🚫 {owner} refused tool: {tool_name} ({detail})"
-            return f"🚫 {owner} refused tool: {tool_name}"
-        return ""
+                base = f"🚫 {owner} refused tool: {tool_name} ({detail})"
+            else:
+                base = f"🚫 {owner} refused tool: {tool_name}"
+        if not base:
+            return ""
+        return f"{base}{self._build_context_suffix(payload)}"
 
     async def _post_tool_status(self, channel: Any, event: str, payload: Dict[str, Any]) -> None:
         if not self._status_events_enable:
@@ -1160,17 +1324,17 @@ class Busy38DiscordBot:
                 return True
             return False
 
-    async def _invoke_agent_for_message(
-            message,
-            content: str,
-            *,
-            is_dm: bool,
-            is_mentioned: bool,
-            trigger_override: Optional[str] = None,
-            coordination: Optional[Dict[str, Any]] = None,
-            route_mode: str = "auto",
-            route_target: Optional[str] = None,
-        ) -> Optional[str]:
+        async def _invoke_agent_for_message(
+                message,
+                content: str,
+                *,
+                is_dm: bool,
+                is_mentioned: bool,
+                trigger_override: Optional[str] = None,
+                coordination: Optional[Dict[str, Any]] = None,
+                route_mode: str = "auto",
+                route_target: Optional[str] = None,
+            ) -> Optional[str]:
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
             channel_name = await _channel_display_name(message.channel)
@@ -1188,32 +1352,36 @@ class Busy38DiscordBot:
                 recipients=[route_target] if route_target else None,
                 known_agents=self._known_route_targets(),
             )
-        user_task = (
-            f"Trigger: {trigger}\n"
-            f"{routing_context}\n"
-            f"Coordination: assignment={bool(coord.get('has_assignment'))}, handoff={bool(coord.get('has_handoff'))}, "
-            f"mentions_self={bool(coord.get('mentions_self'))}, "
-            f"assigned_to_self={bool(coord.get('explicit_assignment_to_self'))}, "
-            f"assigned_to_other={bool(coord.get('explicit_assignment_to_other'))}, "
-            f"handoff_to_self={bool(coord.get('handoff_to_self'))}, "
-            f"handoff_to_other={bool(coord.get('handoff_to_other'))}, "
-            f"other_agent_ids={','.join(str(x) for x in mentioned_other_agents) or 'none'}\n"
-            f"New message from {message.author} ({message.author.id}):\n"
-            f"{content}\n\n"
-            "Respond as Busy38 in this Discord channel, or output [no-response /] if you should stay silent."
-        )
+            user_task = (
+                f"Trigger: {trigger}\n"
+                f"{routing_context}\n"
+                f"Coordination: assignment={bool(coord.get('has_assignment'))}, handoff={bool(coord.get('has_handoff'))}, "
+                f"mentions_self={bool(coord.get('mentions_self'))}, "
+                f"assigned_to_self={bool(coord.get('explicit_assignment_to_self'))}, "
+                f"assigned_to_other={bool(coord.get('explicit_assignment_to_other'))}, "
+                f"handoff_to_self={bool(coord.get('handoff_to_self'))}, "
+                f"handoff_to_other={bool(coord.get('handoff_to_other'))}, "
+                f"other_agent_ids={','.join(str(x) for x in mentioned_other_agents) or 'none'}\n"
+                f"New message from {message.author} ({message.author.id}):\n"
+                f"{content}\n\n"
+                "Respond as Busy38 in this Discord channel, or output [no-response /] if you should stay silent."
+            )
 
-        async def _orchestration_status_update(context: Dict[str, Any], event: str, payload: Dict[str, Any]) -> None:
-            if not str(event).startswith("tool."):
-                return
-            await self._post_tool_status(message.channel, event, payload)
+            async def _orchestration_status_update(context: Dict[str, Any], event: str, payload: Dict[str, Any]) -> None:
+                if not str(event).startswith("tool."):
+                    return
+                await self._post_tool_status(message.channel, event, payload)
 
-        ctx_messages = self._build_context_messages(key=key, system_prompt=sys_prompt, user_task=user_task)
-        return await self.orchestrator.run_agent_loop(
-            task=user_task,
-            context=ctx_messages,
-            status_callback=_orchestration_status_update,
-        )
+            ctx_messages = self._build_context_messages(
+                key=key,
+                system_prompt=sys_prompt,
+                user_task=user_task,
+            )
+            return await self.orchestrator.run_agent_loop(
+                task=user_task,
+                context=ctx_messages,
+                status_callback=_orchestration_status_update,
+            )
         
         @self.bot.event
         async def on_message(message):
