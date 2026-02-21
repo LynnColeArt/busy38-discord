@@ -21,9 +21,11 @@ from core.attachments.intake import (
     ATTACHMENT_DECISION_ACCEPT,
     ATTACHMENT_DECISION_BLOCK,
     ATTACHMENT_DECISION_QUARANTINE,
-    extract_attachment_text_preview,
-    _assess_attachment_intake,
     attachment_summary_line,
+)
+from core.cognition.attachment_intake import (
+    extract_attachment_text_preview,
+    make_intake_decision,
     sanitize_attachment_for_transcript,
 )
 
@@ -487,7 +489,6 @@ async def extract_message_attachments(
                         entry["text_preview"] = text
             except Exception:
                 pass
-
-        _assess_attachment_intake(entry)
+        make_intake_decision(entry)
         out.append(entry)
     return out
