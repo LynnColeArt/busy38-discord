@@ -62,3 +62,19 @@ async def run_auto_clear_cycle(payload: Optional[Dict[str, Any]] = None) -> Dict
     if hasattr(result, "__await__"):
         return await result
     return result
+
+
+async def run_context_summary_cycle(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Execute one context-summary cycle through the active Discord controller.
+    """
+    ctrl = get_controller()
+    if ctrl is None:
+        return {"success": False, "skipped": "discord_controller_not_ready", "trigger": "heartbeat"}
+    fn = getattr(ctrl, "run_context_summary_cycle", None)
+    if not callable(fn):
+        return {"success": False, "skipped": "discord_controller_missing_context_summary"}
+    result = fn(trigger="heartbeat", payload=payload or {})
+    if hasattr(result, "__await__"):
+        return await result
+    return result

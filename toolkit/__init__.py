@@ -23,7 +23,13 @@ import uuid
 
 from core.cheatcodes.registry import register_namespace
 from .discord_transcript import DiscordTranscriptLogger
-from .discord_runtime import get_bot, get_controller, get_active_context, run_auto_clear_cycle
+from .discord_runtime import (
+    get_bot,
+    get_controller,
+    get_active_context,
+    run_auto_clear_cycle,
+    run_context_summary_cycle,
+)
 from .discord_attachments import build_discord_files, close_discord_files, normalize_attachment_specs
 
 logger = logging.getLogger(__name__)
@@ -52,23 +58,38 @@ def _maybe_register_heartbeat_jobs() -> None:
     except Exception:
         logger.debug("Heartbeat hooks unavailable; skipping discord auto-clear hook registration")
         return
-
     @on_heartbeat_register_jobs(priority=20)
     def _register_discord_jobs(manager, context=None):
-        if not _truthy(os.getenv("DISCORD_AUTO_CLEAR_ENABLE", "0")):
-            return
-        interval = max(60, int(os.getenv("DISCORD_AUTO_CLEAR_INTERVAL_SEC", "900")))
-        manager.register_job(
-            name="discord_auto_clear",
-            interval_seconds=interval,
-            source="plugin:busy-38-discord",
-            run_immediately=False,
-            callback=run_auto_clear_cycle,
-            metadata={
-                "window_hours": int(os.getenv("DISCORD_CLEAR_WINDOW_HOURS", "72")),
-                "min_gap_sec": int(os.getenv("DISCORD_AUTO_CLEAR_MIN_GAP_SEC", "21600")),
-            },
-        )
+        if _truthy(os.getenv("DISCORD_AUTO_CLEAR_ENABLE", "0")):
+            interval = max(60, int(os.getenv("DISCORD_AUTO_CLEAR_INTERVAL_SEC", "900")))
+            manager.register_job(
+                name="discord_auto_clear",
+                interval_seconds=interval,
+                source="plugin:busy-38-discord",
+                run_immediately=False,
+                callback=run_auto_clear_cycle,
+                metadata={
+                    "window_hours": int(os.getenv("DISCORD_CLEAR_WINDOW_HOURS", "72")),
+                    "min_gap_sec": int(os.getenv("DISCORD_AUTO_CLEAR_MIN_GAP_SEC", "21600")),
+                },
+            )
+
+        if _truthy(os.getenv("DISCORD_CONTEXT_SUMMARY_ENABLE", "0")):
+            summary_interval = max(
+                60,
+                int(os.getenv("DISCORD_CONTEXT_SUMMARY_INTERVAL_SEC", "3600")),
+            )
+            manager.register_job(
+                name="discord_context_summary",
+                interval_seconds=summary_interval,
+                source="plugin:busy-38-discord",
+                run_immediately=False,
+                callback=run_context_summary_cycle,
+                metadata={
+                    "window_hours": int(os.getenv("DISCORD_CONTEXT_SUMMARY_WINDOW_HOURS", "24")),
+                    "min_gap_sec": int(os.getenv("DISCORD_CONTEXT_SUMMARY_MIN_GAP_SEC", "3600")),
+                },
+            )
 
 
 def _schedule_coro(coro) -> None:
