@@ -28,6 +28,8 @@ except ImportError:
 
 from core.orchestration.integration import Busy38Orchestrator, OrchestratorConfig
 from core.plugins.manager import PluginManager
+from core.session import SessionStore
+from core.security.redaction import scrub_secrets, truncate
 
 # Discord "citizen" state
 from .discord_state import (
@@ -43,6 +45,7 @@ from .discord_attachments import (
     build_discord_files,
     close_discord_files,
     extract_message_attachments,
+    sanitize_attachment_for_transcript,
     parse_attach_directives,
 )
 
@@ -59,7 +62,8 @@ from .discord_runtime import (
 # SquidKeys integration
 try:
     import sys
-    _candidates = [Path(__file__).resolve().parents[i] for i in range(1, 8)]
+    _parents = Path(__file__).resolve().parents
+    _candidates = [_parents[i] for i in range(1, len(_parents))]
     for base in _candidates:
         squidkeys_path = base / "SquidKeys" / "src"
         if squidkeys_path.exists():
@@ -82,12 +86,12 @@ class Busy38DiscordBot:
         "orchestrator": "main",
         "nora": "nora",
         "alex": "alex",
-        "captain": "nora",
         "captainhook": "nora",
+        "captain": "nora",
     }
-    _KNOWN_ROUTE_TARGETS = ("main", "nora", "alex")
-    _HEY_ROUTE_RE = re.compile(r"(?i)^\s*hey\s+([a-z][a-z0-9._-]{0,31})(?:\s*[:,;\\-]?\s+|\\s+$)(.*)$")
-    _AT_ROUTE_RE = re.compile(r"(?i)^\s*@([a-z][a-z0-9._-]{0,31})(?:\s*[:,;\\-]?\s+|\\s+$)(.*)$")
+    _KNOWN_ROUTE_TARGETS = sorted(set(_KNOWN_ROUTE_ALIAS_MAP.values()))
+    _HEY_ROUTE_RE = re.compile(r"(?i)^\s*hey\s+([a-z][a-z0-9._-]{0,31})(?:\s*[:,;\-]?\s+|\s+$)(.*)$")
+    _AT_ROUTE_RE = re.compile(r"(?i)^\s*@([a-z][a-z0-9._-]{0,31})(?:\s*[:,;\-]?\s+|\s+$)(.*)$")
     
     def __init__(self, 
                  token: Optional[str] = None, 
@@ -128,6 +132,14 @@ class Busy38DiscordBot:
         
         # User allowlist for DMs (security) - from SquidKeys, env, or parameter
         self.allowed_users = self._get_allowed_users_from_squidkeys() or self._parse_allowed_users_env() or (set(allowed_users) if allowed_users else None)
+
+        # Ensure core namespaces (including sess:*) are present in this transport process.
+        try:
+            from core.cheatcodes.setup import register_core_namespaces
+
+            register_core_namespaces()
+        except Exception:
+            pass
         
         # Create or use provided orchestrator
         if orchestrator:
@@ -151,6 +163,18 @@ class Busy38DiscordBot:
             self.transcript.connect()
         except Exception as e:
             logger.warning(f"Discord transcript logger disabled: {e}")
+
+        # Session event store (transport-agnostic). This enables cross-client resume later.
+        self._sess_enable = self._truthy_env("DISCORD_SESSION_LOG_ENABLE", default="1")
+        self._sess_auto_bind = self._truthy_env("DISCORD_SESSION_AUTO_BIND", default="1")
+        self._sess_store: SessionStore | None = None
+        self._sess_cache: Dict[str, str] = {}
+        if self._sess_enable:
+            try:
+                self._sess_store = SessionStore()
+            except Exception as e:
+                logger.info("Discord session store disabled: %s", e)
+                self._sess_store = None
 
         # Per-channel serialization and throttling (avoid overlapping LLM calls)
         self._channel_locks: dict[int, asyncio.Lock] = {}
@@ -206,6 +230,12 @@ class Busy38DiscordBot:
         self._clear_state_file = Path(os.getenv("DISCORD_CLEAR_STATE_PATH", "./data/discord_clear_state.json"))
         self._last_clear_by_channel: Dict[str, float] = {}
         self._load_clear_state()
+        self._summary_marker = "[busy38:summary]"
+        self._summary_window_hours = max(1, int(os.getenv("DISCORD_CONTEXT_SUMMARY_WINDOW_HOURS", "24")))
+        self._summary_min_gap_sec = max(60, int(os.getenv("DISCORD_CONTEXT_SUMMARY_MIN_GAP_SEC", "3600")))
+        self._summary_state_file = Path(os.getenv("DISCORD_CONTEXT_SUMMARY_STATE_PATH", "./data/discord_context_summary_state.json"))
+        self._last_summary_by_channel: Dict[str, float] = {}
+        self._load_summary_state()
 
         # Attachment controls (ingest + send).
         self._attachment_include_urls_in_content = self._truthy_env("DISCORD_ATTACHMENT_INCLUDE_URLS", default="1")
@@ -226,7 +256,6 @@ class Busy38DiscordBot:
         self._status_min_interval_sec = max(0.2, float(os.getenv("DISCORD_STATUS_MIN_INTERVAL_SEC", "2.5")))
         self._status_delete_on_finish = self._truthy_env("DISCORD_STATUS_DELETE_ON_FINISH", default="1")
         self._status_include_args = self._truthy_env("DISCORD_STATUS_INCLUDE_ARGS", default="0")
-        self._status_events_enable = self._truthy_env("DISCORD_STATUS_EVENT_FEEDBACK", default="1")
         self._status_msg_by_channel: Dict[int, Any] = {}
         self._status_last_update_unix: Dict[int, float] = {}
         
@@ -246,66 +275,208 @@ class Busy38DiscordBot:
                 out.append(e)
         return out
 
-    @classmethod
-    def _known_route_targets(cls) -> List[str]:
-        return list(cls._KNOWN_ROUTE_TARGETS)
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
-    def _normalize_route_alias(raw: Optional[str]) -> str:
-        if not raw:
-            return ""
-        return re.sub(r"[^a-z0-9._-]", "", str(raw).lower().strip())
-
-    @classmethod
-    def _parse_explicit_route(cls, content: str) -> tuple[Optional[str], str]:
-        raw = (content or "").strip()
-        if not raw:
-            return None, raw
-        m = cls._HEY_ROUTE_RE.match(raw)
-        if m:
-            alias = (m.group(1) or "").strip()
-            message = (m.group(2) or "").strip()
-            return alias, message
-        m = cls._AT_ROUTE_RE.match(raw)
-        if m:
-            alias = (m.group(1) or "").strip()
-            message = (m.group(2) or "").strip()
-            return alias, message
-        return None, raw
-
-    @classmethod
-    def _resolve_explicit_route_target(cls, raw_alias: Optional[str]) -> tuple[Optional[str], bool]:
-        alias = cls._normalize_route_alias(raw_alias)
-        if not alias:
-            return None, False
-        mapped = cls._KNOWN_ROUTE_ALIAS_MAP.get(alias)
-        if mapped:
-            return mapped, True
-        return None, False
+    def _coerce_str(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, str):
+            s = value.strip()
+            return s or None
+        s = str(value).strip()
+        return s or None
 
     @staticmethod
-    def _format_routing_context(
-        *,
-        routing_mode: str,
-        route_source: str,
-        target_agent_id: Optional[str],
-        recipients: Optional[List[str]] = None,
-        known_agents: Optional[List[str]] = None,
-    ) -> str:
-        lines = [
-            "Routing context:",
-            f"- mode: {routing_mode}",
-            f"- route_source: {route_source}",
+    def _as_dict(raw: Any) -> Dict[str, Any]:
+        return raw if isinstance(raw, dict) else {}
+
+    def _extract_context_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        payload_dict = self._as_dict(payload)
+        metadata = self._as_dict(payload_dict.get("metadata"))
+        context_contract = self._as_dict(payload_dict.get("context_contract"))
+        context_payload = self._as_dict(payload_dict.get("context_payload"))
+        metadata_context_payload = self._as_dict(metadata.get("context_payload"))
+        metadata_contract = self._as_dict(metadata.get("context_contract"))
+        nested_contract = self._as_dict(context_payload.get("context_contract"))
+        nested_metadata_contract = self._as_dict(metadata_context_payload.get("context_contract"))
+
+        candidates = [
+            payload_dict,
+            context_payload,
+            metadata_context_payload,
+            context_contract,
+            metadata_contract,
+            nested_contract,
+            nested_metadata_contract,
+            metadata,
         ]
-        if target_agent_id:
-            lines.append(f"- explicit_target: {target_agent_id}")
-        if recipients:
-            lines.append("- recipients: " + ",".join(recipients))
-        if known_agents:
-            lines.append("- known_agents: " + ",".join(known_agents))
-        if routing_mode == "direct" and not target_agent_id:
-            lines.append("- explicit_target_missing: true")
-        return "\n".join(lines)
+
+        schema_version = None
+        budget_tokens = None
+        budget_usage_tokens = None
+        agent_profile_version = None
+        context_source = None
+        compat_mode = None
+        provenance = None
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if schema_version is None:
+                schema_version = self._coerce_int(candidate.get("context_schema_version"))
+            if budget_tokens is None:
+                budget_tokens = self._coerce_int(candidate.get("context_budget_tokens"))
+            if budget_usage_tokens is None:
+                budget_usage_tokens = self._coerce_int(candidate.get("budget_usage_tokens"))
+            if agent_profile_version is None:
+                agent_profile_version = self._coerce_int(candidate.get("agent_profile_version"))
+            if context_source is None:
+                context_source = self._coerce_str(candidate.get("context_source"))
+            if compat_mode is None:
+                compat_mode = self._coerce_str(candidate.get("context_contract_compat_mode"))
+            if provenance is None:
+                p = candidate.get("provenance")
+                if isinstance(p, dict):
+                    provenance = self._as_dict(p)
+
+        used_legacy_payload = False
+        if isinstance(context_payload, dict) and isinstance(context_payload.get("context_contract"), dict):
+            inner_contract = self._as_dict(context_payload.get("context_contract"))
+            if inner_contract:
+                used_legacy_payload = True
+                if schema_version is None:
+                    schema_version = self._coerce_int(inner_contract.get("context_schema_version"))
+                if budget_tokens is None:
+                    budget_tokens = self._coerce_int(inner_contract.get("context_budget_tokens"))
+                if budget_usage_tokens is None:
+                    budget_usage_tokens = self._coerce_int(inner_contract.get("budget_usage_tokens"))
+                if agent_profile_version is None:
+                    agent_profile_version = self._coerce_int(inner_contract.get("agent_profile_version"))
+                if context_source is None:
+                    context_source = self._coerce_str(inner_contract.get("context_source"))
+                if provenance is None and isinstance(inner_contract.get("provenance"), dict):
+                    provenance = self._as_dict(inner_contract.get("provenance"))
+
+        if schema_version is None:
+            schema_version = 1
+
+        if compat_mode:
+            compat_mode = compat_mode.strip().lower()
+        else:
+            has_contract_hints = any(
+                (
+                    source.get("context_schema_version") is not None
+                    or source.get("context_budget_tokens") is not None
+                    or source.get("budget_usage_tokens") is not None
+                    or source.get("agent_profile_version") is not None
+                    or source.get("context_source") is not None
+                )
+                for source in candidates
+                if isinstance(source, dict)
+            )
+            if has_contract_hints:
+                compat_mode = "legacy" if used_legacy_payload else "modern"
+            else:
+                compat_mode = "legacy"
+
+        normalized: Dict[str, Any] = {
+            "context_schema_version": schema_version,
+            "context_budget_tokens": budget_tokens,
+            "budget_usage_tokens": budget_usage_tokens,
+            "agent_profile_version": agent_profile_version,
+            "context_source": context_source,
+            "context_contract_compat_mode": compat_mode,
+            "provenance": provenance,
+        }
+        if context_contract:
+            normalized["context_contract"] = context_contract
+        if context_payload:
+            normalized["context_payload"] = context_payload
+        return {
+            key: value
+            for key, value in normalized.items()
+            if value is not None and not (isinstance(value, dict) and not value)
+        }
+
+    def _sess_writer_id(self) -> str:
+        return (os.getenv("BUSY38_WRITER_ID") or f"discord:{os.getpid()}").strip() or f"discord:{os.getpid()}"
+
+    def _sess_surface_id(self, *, guild_id: Optional[int], channel_id: int) -> str:
+        gid = guild_id if guild_id is not None else 0
+        return f"discord:{gid}:{int(channel_id)}"
+
+    def _sess_get_or_create(self, *, surface_id: str, title: str, metadata: Dict[str, Any]) -> Optional[str]:
+        st = self._sess_store
+        if st is None:
+            return None
+        sid = self._sess_cache.get(surface_id)
+        if sid:
+            return sid
+        try:
+            sid = st.get_bound_session(surface_id=surface_id)
+            if not sid and self._sess_auto_bind:
+                sid = st.create_session(
+                    title=str(title or ""),
+                    workspace_root="",
+                    writer_id=self._sess_writer_id(),
+                    metadata=metadata,
+                )
+                st.bind_surface(surface_id=surface_id, session_id=sid)
+            if sid:
+                self._sess_cache[surface_id] = sid
+            return sid
+        except Exception:
+            return None
+
+    def _sess_append_chat(
+        self,
+        *,
+        surface_id: str,
+        role: str,
+        text: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        st = self._sess_store
+        if st is None:
+            return
+        safe = truncate(scrub_secrets(str(text or "")), max_chars=12000)
+        title = str(metadata.get("session_title") or metadata.get("title") or "Discord session")
+        sid = self._sess_get_or_create(surface_id=surface_id, title=title, metadata=metadata)
+        if not sid:
+            return
+        try:
+            st.append_event(
+                session_id=sid,
+                writer_id=self._sess_writer_id(),
+                type="chat.message",
+                payload={
+                    "transport": "discord",
+                    "surface_id": surface_id,
+                    "role": str(role or "unknown"),
+                    "text": safe,
+                    "metadata": metadata,
+                },
+            )
+        except Exception:
+            return
 
     @staticmethod
     def _coordination_hints(*, content: str, self_id: int, mentioned_ids: List[int], mentioned_bot_ids: List[int]) -> Dict[str, Any]:
@@ -382,27 +553,112 @@ class Busy38DiscordBot:
         reaction = m.group(1).strip() if m else None
         return is_silent, reaction
 
+    @classmethod
+    def _known_route_targets(cls) -> List[str]:
+        return list(cls._KNOWN_ROUTE_TARGETS)
+
+    @staticmethod
+    def _normalize_route_alias(raw: Optional[str]) -> str:
+        if not raw:
+            return ""
+        return re.sub(r"[^a-z0-9._-]", "", str(raw).lower().strip())
+
+    @classmethod
+    def _parse_explicit_route(cls, content: str) -> tuple[Optional[str], str]:
+        """Parse explicit routing cues from user content.
+
+        Supported forms:
+        - `hey <alias> ...`
+        - `@<alias> ...`
+        """
+        raw = (content or "").strip()
+        if not raw:
+            return None, ""
+
+        m = cls._HEY_ROUTE_RE.match(raw)
+        if m:
+            alias = (m.group(1) or "").strip()
+            message = (m.group(2) or "").strip()
+            return alias, message
+
+        m = cls._AT_ROUTE_RE.match(raw)
+        if m:
+            alias = (m.group(1) or "").strip()
+            message = (m.group(2) or "").strip()
+            return alias, message
+
+        return None, content
+
+    @classmethod
+    def _resolve_explicit_route_target(cls, raw_alias: Optional[str]) -> tuple[Optional[str], bool]:
+        """Resolve explicit routing alias to a canonical target name.
+
+        Returns (target, resolved). `resolved=False` when the alias is unrecognized.
+        """
+        alias = cls._normalize_route_alias(raw_alias)
+        if not alias:
+            return None, False
+        target = cls._KNOWN_ROUTE_ALIAS_MAP.get(alias)
+        if target:
+            return target, True
+        return None, False
+
+    @staticmethod
+    def _format_routing_context(
+        *,
+        routing_mode: str,
+        route_source: str,
+        target_agent_id: Optional[str],
+        recipients: Optional[List[str]] = None,
+        known_agents: Optional[List[str]] = None,
+    ) -> str:
+        lines = [
+            "Routing context:",
+            f"- mode: {routing_mode}",
+            f"- route_source: {route_source}",
+        ]
+        if target_agent_id:
+            lines.append(f"- explicit_target: {target_agent_id}")
+        if recipients:
+            lines.append("- recipients: " + ",".join(recipients))
+        if known_agents:
+            lines.append("- known_agents: " + ",".join(known_agents))
+        if routing_mode == "direct" and not target_agent_id:
+            lines.append("- explicit_target_missing: true")
+        return "\n".join(lines)
+
     def _load_clear_state(self) -> None:
+        self._last_clear_by_channel = self._load_state_file(self._clear_state_file)
+
+    def _load_summary_state(self) -> None:
+        self._last_summary_by_channel = self._load_state_file(self._summary_state_file)
+
+    def _load_state_file(self, state_file: Path) -> Dict[str, float]:
         data = None
-        if self._clear_state_file.exists():
+        if state_file.exists():
             try:
-                data = json.loads(self._clear_state_file.read_text(encoding="utf-8"))
+                data = json.loads(state_file.read_text(encoding="utf-8"))
             except Exception:
                 data = None
         if isinstance(data, dict):
-            self._last_clear_by_channel = {str(k): float(v) for k, v in data.items()}
-        else:
-            self._last_clear_by_channel = {}
+            return {str(k): float(v) for k, v in data.items()}
+        return {}
 
-    def _save_clear_state(self) -> None:
+    def _save_state_file(self, state_by_channel: Dict[str, float], state_file: Path) -> None:
         try:
-            self._clear_state_file.parent.mkdir(parents=True, exist_ok=True)
-            self._clear_state_file.write_text(
-                json.dumps(self._last_clear_by_channel, indent=2, sort_keys=True, ensure_ascii=True),
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(
+                json.dumps(state_by_channel, indent=2, sort_keys=True, ensure_ascii=True),
                 encoding="utf-8",
             )
         except Exception as e:
-            logger.warning(f"Failed to write clear-state file: {e}")
+            logger.warning(f"Failed to write state file: {e}")
+
+    def _save_clear_state(self) -> None:
+        self._save_state_file(self._last_clear_by_channel, self._clear_state_file)
+
+    def _save_summary_state(self) -> None:
+        self._save_state_file(self._last_summary_by_channel, self._summary_state_file)
 
     @staticmethod
     def _fallback_summary_from_rows(rows: List[Dict[str, Any]], *, max_lines: int = 20) -> str:
@@ -481,18 +737,28 @@ class Busy38DiscordBot:
         initiated_by: str,
         window_hours: Optional[int] = None,
         force: bool = False,
+        marker: Optional[str] = None,
+        min_gap_sec: Optional[int] = None,
+        state_by_channel: Optional[Dict[str, float]] = None,
+        state_file: Optional[Path] = None,
+        skip_if_empty: bool = False,
     ) -> Dict[str, Any]:
         if channel is None:
             return {"success": False, "error": "channel_unavailable"}
 
-        hours = max(1, int(window_hours or self._clear_window_hours))
+        clear_marker = marker or self._clear_marker
+        clear_hours = max(1, int(window_hours or self._clear_window_hours))
+        clear_gap = max(60, int(min_gap_sec if min_gap_sec is not None else self._auto_clear_min_gap_sec))
+        clear_state = state_by_channel if state_by_channel is not None else self._last_clear_by_channel
+        clear_state_file = state_file or self._clear_state_file
+
         now_unix = time.time()
         channel_id = int(getattr(channel, "id", 0))
         key_id = str(channel_id)
-        last = float(self._last_clear_by_channel.get(key_id, 0.0))
+        last = float(clear_state.get(key_id, 0.0))
         age = now_unix - last
-        if (not force) and age < float(self._auto_clear_min_gap_sec):
-            return {"success": True, "skipped": "cooldown", "seconds_until_next": int(self._auto_clear_min_gap_sec - age)}
+        if (not force) and age < float(clear_gap):
+            return {"success": True, "skipped": "cooldown", "seconds_until_next": int(clear_gap - age)}
 
         guild = getattr(channel, "guild", None)
         gid = guild.id if guild else None
@@ -502,18 +768,28 @@ class Busy38DiscordBot:
         try:
             rows = self.transcript.recent_messages(
                 project_id=project_id,
-                max_age_hours=hours,
+                max_age_hours=clear_hours,
                 limit=self._clear_max_messages,
             )
         except Exception:
             rows = []
 
+        if skip_if_empty and not rows:
+            return {
+                "success": True,
+                "skipped": "empty_window",
+                "channel_id": channel_id,
+                "project_id": project_id,
+                "messages_seen": 0,
+                "seconds_until_next": int(clear_gap),
+            }
+
         channel_name = getattr(channel, "name", None) or str(channel)
-        summary = await self._summarize_rows_for_agents(rows=rows, channel_name=channel_name, window_hours=hours)
+        summary = await self._summarize_rows_for_agents(rows=rows, channel_name=channel_name, window_hours=clear_hours)
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         content = (
-            f"{self._clear_marker}\n"
-            f"**Context Summary ({hours}h) - {channel_name}**\n"
+            f"{clear_marker}\n"
+            f"**Context Summary ({clear_hours}h) - {channel_name}**\n"
             f"_Generated by Busy38 ({initiated_by}) at {ts}_\n\n"
             f"{summary}"
         )
@@ -522,13 +798,13 @@ class Busy38DiscordBot:
 
         msg = await channel.send(content)
 
-        # Keep latest auto-clear pin, retire older ones from this bot.
+        # Keep latest marker-specific pin, retire older ones from this bot.
         try:
             pins = await channel.pins()
             for p in pins:
                 if p.id == msg.id:
                     continue
-                if p.author.id == self.bot.user.id and str(p.content or "").startswith(self._clear_marker):
+                if p.author.id == self.bot.user.id and str(p.content or "").startswith(clear_marker):
                     try:
                         await p.unpin(reason="Replaced by newer Busy38 context summary")
                     except Exception:
@@ -562,8 +838,13 @@ class Busy38DiscordBot:
         except Exception:
             pass
 
-        self._last_clear_by_channel[key_id] = now_unix
-        self._save_clear_state()
+        clear_state[key_id] = now_unix
+        if clear_state_file == self._clear_state_file:
+            self._save_clear_state()
+        elif clear_state_file == self._summary_state_file:
+            self._save_summary_state()
+        else:
+            self._save_state_file(clear_state, clear_state_file)
 
         return {
             "success": True,
@@ -572,7 +853,8 @@ class Busy38DiscordBot:
             "messages_seen": len(rows),
             "summary_message_id": msg.id,
             "pinned": pinned,
-            "hours": hours,
+            "hours": clear_hours,
+            "marker": clear_marker,
         }
 
     async def run_auto_clear_cycle(self, *, trigger: str = "heartbeat", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -586,18 +868,7 @@ class Busy38DiscordBot:
         cleared = 0
         skipped = 0
         errors: List[str] = []
-        for key, cfg in self.state.list_subscriptions():
-            if key.guild_id is None:
-                continue
-            guild = self.bot.get_guild(key.guild_id)
-            if guild is None:
-                continue
-            channel = guild.get_channel(key.channel_id)
-            if channel is None:
-                try:
-                    channel = await self.bot.fetch_channel(key.channel_id)
-                except Exception:
-                    continue
+        async for key, channel in self._iter_subscribed_guild_channels():
             processed += 1
             try:
                 res = await self._clear_channel_context(channel, initiated_by=trigger, force=False)
@@ -617,6 +888,74 @@ class Busy38DiscordBot:
             "errors": errors,
             "payload": payload or {},
         }
+
+    async def run_context_summary_cycle(self, *, trigger: str = "heartbeat", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Run one periodic context-summary sweep for subscribed guild channels.
+        """
+        if not self.bot or not self.bot.is_ready():
+            return {"success": True, "skipped": "discord_not_ready", "trigger": trigger}
+
+        metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+        try:
+            window_hours = max(1, int(metadata.get("window_hours", self._summary_window_hours)))
+        except (TypeError, ValueError):
+            window_hours = self._summary_window_hours
+        try:
+            min_gap_sec = max(60, int(metadata.get("min_gap_sec", self._summary_min_gap_sec)))
+        except (TypeError, ValueError):
+            min_gap_sec = self._summary_min_gap_sec
+
+        processed = 0
+        cleared = 0
+        skipped = 0
+        errors: List[str] = []
+        async for key, channel in self._iter_subscribed_guild_channels():
+            processed += 1
+            try:
+                res = await self._clear_channel_context(
+                    channel,
+                    initiated_by=f"{trigger} (summary)",
+                    window_hours=window_hours,
+                    force=False,
+                    marker=self._summary_marker,
+                    min_gap_sec=min_gap_sec,
+                    state_by_channel=self._last_summary_by_channel,
+                    state_file=self._summary_state_file,
+                    skip_if_empty=True,
+                )
+                if res.get("skipped"):
+                    skipped += 1
+                elif res.get("success"):
+                    cleared += 1
+            except Exception as e:
+                errors.append(f"{key.channel_id}:{e}")
+
+        return {
+            "success": True,
+            "trigger": trigger,
+            "job": "context_summary",
+            "processed": processed,
+            "cleared": cleared,
+            "skipped": skipped,
+            "errors": errors,
+            "payload": payload or {},
+        }
+
+    async def _iter_subscribed_guild_channels(self):
+        for key, _cfg in self.state.list_subscriptions():
+            if key.guild_id is None:
+                continue
+            guild = self.bot.get_guild(key.guild_id)
+            if guild is None:
+                continue
+            channel = guild.get_channel(key.channel_id)
+            if channel is None:
+                try:
+                    channel = await self.bot.fetch_channel(key.channel_id)
+                except Exception:
+                    continue
+            yield key, channel
 
     async def _can_use_clear(self, ctx) -> bool:
         try:
@@ -783,7 +1122,6 @@ class Busy38DiscordBot:
             "You can see recent channel history and should behave like a normal participant.\n"
             "If no response is needed, output exactly: [no-response /]\n"
             "Optional: include [react:EMOJI] to react to the triggering message when staying silent.\n\n"
-            f"Known routing targets: {', '.join(self._known_route_targets())}\n"
             f"Context:\n"
             f"- guild: {guild_name or 'DM'}\n"
             f"- channel: {channel_name} (id={key.channel_id})\n"
@@ -909,211 +1247,6 @@ class Busy38DiscordBot:
             return f"*{a}…*"
         return f"*is {a}…*"
 
-    @staticmethod
-    def _coerce_int(value: Any) -> Optional[int]:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return int(value)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
-        if isinstance(value, str):
-            try:
-                return int(value.strip())
-            except ValueError:
-                return None
-        return None
-
-    @staticmethod
-    def _coerce_str(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return str(value).lower()
-        if isinstance(value, str):
-            text = value.strip()
-            return text or None
-        text = str(value).strip()
-        return text or None
-
-    @staticmethod
-    def _as_dict(raw: Any) -> Dict[str, Any]:
-        return raw if isinstance(raw, dict) else {}
-
-    def _extract_context_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        metadata = self._as_dict(payload.get("metadata"))
-        context_contract = self._as_dict(payload.get("context_contract"))
-        context_payload = self._as_dict(payload.get("context_payload"))
-        metadata_context_payload = self._as_dict(metadata.get("context_payload"))
-        metadata_contract = self._as_dict(metadata.get("context_contract"))
-        nested_contract = self._as_dict(context_payload.get("context_contract"))
-        nested_metadata_contract = self._as_dict(metadata_context_payload.get("context_contract"))
-
-        candidates = [
-            payload,
-            context_payload,
-            metadata_context_payload,
-            context_contract,
-            metadata_contract,
-            nested_contract,
-            nested_metadata_contract,
-            metadata,
-        ]
-
-        schema_version = None
-        budget_tokens = None
-        budget_usage_tokens = None
-        agent_profile_version = None
-        context_source = None
-        compat_mode = None
-        provenance = None
-
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            if schema_version is None:
-                schema_version = self._coerce_int(candidate.get("context_schema_version"))
-            if budget_tokens is None:
-                budget_tokens = self._coerce_int(candidate.get("context_budget_tokens"))
-            if budget_usage_tokens is None:
-                budget_usage_tokens = self._coerce_int(candidate.get("budget_usage_tokens"))
-            if agent_profile_version is None:
-                agent_profile_version = self._coerce_int(candidate.get("agent_profile_version"))
-            if context_source is None:
-                context_source = self._coerce_str(candidate.get("context_source"))
-            if compat_mode is None:
-                compat_mode = self._coerce_str(candidate.get("context_contract_compat_mode"))
-            if provenance is None:
-                prov = candidate.get("provenance")
-                if isinstance(prov, dict):
-                    provenance = self._as_dict(prov)
-
-        used_legacy_payload = False
-        if isinstance(context_payload, dict) and isinstance(context_payload.get("context_contract"), dict):
-            inner_contract = self._as_dict(context_payload.get("context_contract"))
-            if inner_contract:
-                used_legacy_payload = True
-                if schema_version is None:
-                    schema_version = self._coerce_int(inner_contract.get("context_schema_version"))
-                if budget_tokens is None:
-                    budget_tokens = self._coerce_int(inner_contract.get("context_budget_tokens"))
-                if budget_usage_tokens is None:
-                    budget_usage_tokens = self._coerce_int(inner_contract.get("budget_usage_tokens"))
-                if agent_profile_version is None:
-                    agent_profile_version = self._coerce_int(inner_contract.get("agent_profile_version"))
-                if context_source is None:
-                    context_source = self._coerce_str(inner_contract.get("context_source"))
-                if provenance is None and isinstance(inner_contract.get("provenance"), dict):
-                    provenance = self._as_dict(inner_contract.get("provenance"))
-
-        if schema_version is None:
-            schema_version = 1
-
-        if not compat_mode:
-            has_contract_hints = any(
-                (
-                    source.get("context_schema_version") is not None
-                    or source.get("context_budget_tokens") is not None
-                    or source.get("budget_usage_tokens") is not None
-                    or source.get("agent_profile_version") is not None
-                    or source.get("context_source") is not None
-                )
-                for source in candidates
-                if isinstance(source, dict)
-            )
-            if has_contract_hints:
-                compat_mode = "legacy" if used_legacy_payload else "modern"
-            else:
-                compat_mode = "legacy"
-        else:
-            compat_mode = compat_mode.strip().lower()
-
-        normalized = {
-            "context_schema_version": schema_version,
-            "context_budget_tokens": budget_tokens,
-            "budget_usage_tokens": budget_usage_tokens,
-            "agent_profile_version": agent_profile_version,
-            "context_source": context_source,
-            "context_contract_compat_mode": compat_mode,
-            "provenance": provenance,
-        }
-        if context_contract:
-            normalized["context_contract"] = context_contract
-        if context_payload:
-            normalized["context_payload"] = context_payload
-        return {k: v for k, v in normalized.items() if v is not None and not (isinstance(v, dict) and not v)}
-
-    def _build_context_suffix(self, payload: Dict[str, Any]) -> str:
-        context = self._extract_context_metadata(payload)
-        source = self._coerce_str(context.get("context_source"))
-        schema = context.get("context_schema_version")
-        budget = context.get("context_budget_tokens")
-        usage = context.get("budget_usage_tokens")
-        mode = self._coerce_str(context.get("context_contract_compat_mode"))
-
-        suffix_parts: List[str] = []
-        if source:
-            suffix_parts.append(f"src={source}")
-        if schema is not None:
-            suffix_parts.append(f"schema={schema}")
-        if usage is not None or budget is not None:
-            if budget is not None:
-                suffix_parts.append(f"tokens={usage if usage is not None else 0}/{budget}")
-            else:
-                suffix_parts.append(f"usage={usage}")
-        if mode:
-            suffix_parts.append(f"mode={mode}")
-        if not suffix_parts:
-            return ""
-        return " [" + ", ".join(suffix_parts) + "]"
-
-    def _format_tool_status_line(self, event: str, payload: Dict[str, Any]) -> str:
-        e = str(event or "").strip().lower()
-        meta = payload.get("metadata")
-        if not isinstance(meta, dict):
-            meta = {}
-        owner = str(payload.get("owner") or meta.get("owner") or "agent")
-        tool = str(payload.get("tool_text") or payload.get("tool") or meta.get("tool") or "").strip()
-        tool_name = tool or "tool request"
-        reason = str(payload.get("reason") or meta.get("reason") or "").strip()
-        err = str(payload.get("error") or meta.get("error") or "").strip()
-        base = ""
-
-        if e == "tool.requested":
-            base = f"🛠️ {owner} requested tool: {tool_name}"
-        if e == "tool.started":
-            base = f"🛠️ {owner} started tool: {tool_name}"
-        if e == "tool.completed":
-            base = f"✅ {owner} completed tool: {tool_name}"
-        if e == "tool.failed":
-            detail = reason or err
-            if detail:
-                base = f"⚠️ {owner} tool failed: {tool_name} ({detail})"
-            else:
-                base = f"⚠️ {owner} tool failed: {tool_name}"
-        if e == "tool.refused":
-            detail = reason
-            if detail:
-                base = f"🚫 {owner} refused tool: {tool_name} ({detail})"
-            else:
-                base = f"🚫 {owner} refused tool: {tool_name}"
-        if not base:
-            return ""
-        return f"{base}{self._build_context_suffix(payload)}"
-
-    async def _post_tool_status(self, channel: Any, event: str, payload: Dict[str, Any]) -> None:
-        if not self._status_events_enable:
-            return
-        line = self._format_tool_status_line(event, payload)
-        if not line:
-            return
-        try:
-            await channel.send(line)
-        except Exception:
-            logger.debug("Failed to post Discord tool status event", exc_info=True)
-
     async def _status_set(self, channel: Any, activity: str, *, force: bool = False) -> None:
         if not self._status_enable:
             return
@@ -1144,6 +1277,8 @@ class Busy38DiscordBot:
                     del self._status_msg_by_channel[cid]
             except Exception:
                 pass
+
+            safe_attachments = [sanitize_attachment_for_transcript(att) for att in attachments]
 
     async def post_status(self, channel: Any, activity: str, *, force: bool = False) -> None:
         """Public wrapper used by hook handlers to narrate work."""
@@ -1197,6 +1332,25 @@ class Busy38DiscordBot:
                     payload = (chunk + suffix).strip()
                     if payload:
                         await channel.send(payload)
+
+            # Record assistant output into the session event stream (best-effort).
+            try:
+                gid = getattr(getattr(channel, "guild", None), "id", None)
+                surface_id = self._sess_surface_id(guild_id=gid, channel_id=int(getattr(channel, "id", 0) or 0))
+                self._sess_append_chat(
+                    surface_id=surface_id,
+                    role="assistant",
+                    text=cleaned,
+                    metadata={
+                        "session_title": f"Discord {gid or 0} #{getattr(channel, 'name', None) or str(channel)}",
+                        "guild_id": gid,
+                        "channel_id": int(getattr(channel, "id", 0) or 0),
+                        "attachments_sent": len(files),
+                        "attachment_errors": attachment_errors[:8] if attachment_errors else [],
+                    },
+                )
+            except Exception:
+                pass
         finally:
             close_discord_files(files)
     
@@ -1242,6 +1396,7 @@ class Busy38DiscordBot:
             # Normalize content and include attachment summary/URLs.
             content = message.content or ""
             attachments: List[Dict[str, Any]] = []
+            safe_attachments: List[Dict[str, Any]] = []
             try:
                 attachments = await extract_message_attachments(
                     message,
@@ -1249,12 +1404,17 @@ class Busy38DiscordBot:
                     preview_max_bytes=self._attachment_text_preview_max_bytes,
                     preview_max_chars=self._attachment_text_preview_max_chars,
                 )
+                safe_attachments = [sanitize_attachment_for_transcript(att) for att in attachments]
                 if attachments:
                     summary = attachment_summary_line(attachments)
                     if summary:
                         content = (content + "\n" + summary).strip()
                 if self._attachment_include_urls_in_content and attachments:
-                    urls = [str(a.get("url")) for a in attachments if a.get("url")]
+                    urls = [
+                        str(a.get("url"))
+                        for a in attachments
+                        if a.get("url") and (a.get("intake_decision") != "block")
+                    ]
                     if urls:
                         content = (content + "\n" + "\n".join(urls)).strip()
             except Exception:
@@ -1268,7 +1428,7 @@ class Busy38DiscordBot:
                 content=content,
                 is_bot=bool(getattr(message.author, "bot", False)),
                 reply_to_id=getattr(getattr(message, "reference", None), "message_id", None),
-                attachments=attachments,
+                attachments=safe_attachments,
             )
             self.state.ingest_message(key, rec)
 
@@ -1289,7 +1449,28 @@ class Busy38DiscordBot:
                         "author_id": message.author.id,
                         "author_name": str(message.author),
                         "is_bot": bool(getattr(message.author, "bot", False)),
-                        "attachments": attachments,
+                        "attachments": safe_attachments,
+                    },
+                )
+            except Exception:
+                pass
+
+            # Log session event stream (transport-agnostic, used for resume/sharing).
+            try:
+                surface_id = self._sess_surface_id(guild_id=gid, channel_id=message.channel.id)
+                self._sess_append_chat(
+                    surface_id=surface_id,
+                    role="user",
+                    text=content,
+                    metadata={
+                        "session_title": f"Discord {await _guild_name(getattr(message, 'guild', None)) or gid} #{await _channel_display_name(message.channel)}",
+                        "guild_id": gid,
+                        "channel_id": message.channel.id,
+                        "message_id": message.id,
+                        "author_id": message.author.id,
+                        "author_name": str(message.author),
+                        "is_bot": bool(getattr(message.author, "bot", False)),
+                        "attachments": safe_attachments,
                     },
                 )
             except Exception:
@@ -1325,16 +1506,15 @@ class Busy38DiscordBot:
             return False
 
         async def _invoke_agent_for_message(
-                message,
-                content: str,
-                *,
-                is_dm: bool,
-                is_mentioned: bool,
-                trigger_override: Optional[str] = None,
-                coordination: Optional[Dict[str, Any]] = None,
-                route_mode: str = "auto",
-                route_target: Optional[str] = None,
-            ) -> Optional[str]:
+            message,
+            content: str,
+            *,
+            is_dm: bool,
+            is_mentioned: bool,
+            trigger_override: Optional[str] = None,
+            coordination: Optional[Dict[str, Any]] = None,
+            route_target: Optional[str] = None,
+        ) -> Optional[str]:
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
             channel_name = await _channel_display_name(message.channel)
@@ -1343,8 +1523,10 @@ class Busy38DiscordBot:
             coord = coordination or {}
             mentioned_other_agents = coord.get("mentioned_other_agents") or []
 
-            # If not explicitly mentioned, give agent a strong prior to be silent unless needed.
-            trigger = trigger_override or ("mention" if is_mentioned else ("dm" if is_dm else "follow"))
+            route_mode = "fallback" if route_target else "auto"
+            if route_target is not None:
+                route_mode = "direct"
+
             routing_context = self._format_routing_context(
                 routing_mode=route_mode,
                 route_source="discord",
@@ -1352,6 +1534,9 @@ class Busy38DiscordBot:
                 recipients=[route_target] if route_target else None,
                 known_agents=self._known_route_targets(),
             )
+
+            # If not explicitly mentioned, give agent a strong prior to be silent unless needed.
+            trigger = trigger_override or ("mention" if is_mentioned else ("dm" if is_dm else "follow"))
             user_task = (
                 f"Trigger: {trigger}\n"
                 f"{routing_context}\n"
@@ -1367,21 +1552,8 @@ class Busy38DiscordBot:
                 "Respond as Busy38 in this Discord channel, or output [no-response /] if you should stay silent."
             )
 
-            async def _orchestration_status_update(context: Dict[str, Any], event: str, payload: Dict[str, Any]) -> None:
-                if not str(event).startswith("tool."):
-                    return
-                await self._post_tool_status(message.channel, event, payload)
-
-            ctx_messages = self._build_context_messages(
-                key=key,
-                system_prompt=sys_prompt,
-                user_task=user_task,
-            )
-            return await self.orchestrator.run_agent_loop(
-                task=user_task,
-                context=ctx_messages,
-                status_callback=_orchestration_status_update,
-            )
+            ctx_messages = self._build_context_messages(key=key, system_prompt=sys_prompt, user_task=user_task)
+            return await self.orchestrator.run_agent_loop(task=user_task, context=ctx_messages)
         
         @self.bot.event
         async def on_message(message):
@@ -1451,8 +1623,7 @@ class Busy38DiscordBot:
                     return
                 content = routed_content
                 route_target = resolved_target
-            elif not route_target:
-                # Last-speaker fallback for follow-up routing.
+            else:
                 gid = message.guild.id if getattr(message, "guild", None) else None
                 key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
                 route_target = self._last_target_by_channel.get(key.as_str())
@@ -1500,9 +1671,6 @@ class Busy38DiscordBot:
 
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
-            route_mode = "fallback" if route_target else "auto"
-            if explicit_alias:
-                route_mode = "direct"
             should_invoke = self._should_invoke_agent(
                 key=key,
                 is_dm=is_dm,
@@ -1570,20 +1738,19 @@ class Busy38DiscordBot:
                             result = await _invoke_agent_for_message(
                                 message,
                                 content,
+                                route_target=route_target,
                                 is_dm=is_dm,
                                 is_mentioned=is_mentioned or is_reply_to_me,
                                 trigger_override="forum_task" if is_new_forum_task else None,
                                 coordination=coordination,
-                                route_mode=route_mode,
-                                route_target=route_target,
                             )
 
                         if status_task:
                             status_task.cancel()
                         await self._status_clear(message.channel)
 
-                    if route_target:
-                        self._last_target_by_channel[key.as_str()] = route_target
+                        if route_target:
+                            self._last_target_by_channel[key.as_str()] = route_target
 
                     # True silence: the agent can emit [no-response /], optional [react:EMOJI].
                     is_silent, requested_reaction = self._parse_no_response_directives(result)
@@ -1621,6 +1788,72 @@ class Busy38DiscordBot:
                 f"Namespaces: {', '.join(status['namespaces'])}\n"
                 f"Iteration: {status.get('iteration', 0)}"
             )
+
+        @self.bot.command(name="sess")
+        async def sess_cmd(ctx, action: str = "status", *args):
+            """
+            Session management helper (transport-agnostic sess:* wired through Discord).
+
+            Examples:
+              !busy38 sess list
+              !busy38 sess create "Title here"
+              !busy38 sess bind <session_id>
+              !busy38 sess status
+              !busy38 sess tail 50
+              !busy38 sess resume
+            """
+            # Keep this privileged: owner OR admin/mod roles (same as clear).
+            if not await self._can_use_clear(ctx):
+                if not await self.bot.is_owner(ctx.author):
+                    await ctx.send("❌ You need owner/admin/mod permissions to manage sessions.")
+                    return
+
+            import inspect
+            import json as _json
+            from core.cheatcodes.registry import cheatcode_registry
+
+            gid = ctx.guild.id if ctx.guild else 0
+            surface_id = self._sess_surface_id(guild_id=(gid or None), channel_id=ctx.channel.id)
+
+            act = (action or "").strip().lower()
+            attrs: Dict[str, Any] = {}
+
+            if act == "list":
+                attrs = {"limit": 20}
+                res = cheatcode_registry.execute("sess", "list", attrs)
+            elif act == "create":
+                title = " ".join(args).strip().strip('"').strip("'")
+                if not title:
+                    title = f"Discord {gid} #{getattr(ctx.channel, 'name', None) or ctx.channel.id}"
+                res = cheatcode_registry.execute("sess", "create", {"title": title})
+            elif act == "bind":
+                if not args:
+                    await ctx.send("Usage: `!busy38 sess bind <session_id>`")
+                    return
+                res = cheatcode_registry.execute("sess", "bind", {"session_id": str(args[0]), "surface_id": surface_id})
+            elif act == "status":
+                res = cheatcode_registry.execute("sess", "status", {"surface_id": surface_id})
+            elif act == "tail":
+                limit = 50
+                if args:
+                    try:
+                        limit = int(args[0])
+                    except Exception:
+                        limit = 50
+                res = cheatcode_registry.execute("sess", "tail", {"surface_id": surface_id, "limit": limit})
+            elif act == "resume":
+                res = cheatcode_registry.execute("sess", "resume", {"surface_id": surface_id})
+            else:
+                await ctx.send("Usage: `!busy38 sess list|create|bind|status|tail|resume`")
+                return
+
+            if inspect.isawaitable(res):
+                res = await res
+
+            blob = _json.dumps(res, indent=2, sort_keys=True)
+            if len(blob) > 1800:
+                blob = blob[:1800] + "\n...(truncated)"
+            await ctx.send("```json\n" + blob + "\n```")
 
         @self.bot.command(name="subscribe")
         @commands.is_owner()
@@ -1841,6 +2074,7 @@ class Busy38DiscordBot:
                 "Mention me, reply to me, DM me, or use `busy38:` / `squidder:` to chat.\n\n"
                 "Commands:\n"
                 "`!busy38 status` - Show system status\n"
+                "`!busy38 sess ...` - Manage Busy sessions (list/bind/resume)\n"
                 "`!busy38 auth` - Show DM authorization status\n"
                 "`!busy38 agents` - List observed bot agents\n"
                 "`!busy38 help` - Show this help\n\n"
