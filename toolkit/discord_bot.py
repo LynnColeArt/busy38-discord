@@ -29,6 +29,12 @@ except ImportError:
 from core.orchestration.integration import Busy38Orchestrator, OrchestratorConfig
 from core.plugins.manager import PluginManager
 from core.session import SessionStore
+from core.cognition.attachment_intake import (
+    ATTACHMENT_DECISION_BLOCK,
+    ATTACHMENT_DECISION_QUARANTINE,
+    ATTACHMENT_DECISION_ACCEPT,
+    assess_text_ingress,
+)
 from core.security.redaction import scrub_secrets, truncate
 
 # Discord "citizen" state
@@ -1388,13 +1394,56 @@ class Busy38DiscordBot:
             except Exception:
                 return None
 
-        async def _ingest_message(message) -> None:
+        def _discord_text_policy_max_chars() -> int:
+            raw = os.getenv("DISCORD_MAX_MESSAGE_CHARS", "").strip()
+            if raw:
+                try:
+                    value = int(raw)
+                    if value > 0:
+                        return value
+                except (TypeError, ValueError):
+                    pass
+            raw = os.getenv("BUSY38_BRIDGE_MAX_MESSAGE_CHARS", "12000").strip()
+            try:
+                value = int(raw)
+                return value if value > 0 else 12000
+            except (TypeError, ValueError):
+                return 12000
+
+        def _assess_discord_text_ingress(
+            text: str,
+        ) -> tuple[str, str, list[str], str, bool, bool]:
+            result = assess_text_ingress(text, max_chars=_discord_text_policy_max_chars())
+            decision = str(result.get("decision") or ATTACHMENT_DECISION_ACCEPT)
+            reasons = list(result.get("intake_reasons") or [])
+            sanitized_text = str(result.get("sanitized_text") or "")
+            policy_version = str(result.get("intake_policy_version") or "")
+
+            orchestrator_text = sanitized_text
+            if decision == ATTACHMENT_DECISION_QUARANTINE and sanitized_text:
+                orchestrator_text = (
+                    "[policy] Input received with policy warnings: "
+                    + ", ".join(reasons)
+                    + "\n"
+                    + sanitized_text
+                )
+
+            return (
+                orchestrator_text,
+                decision,
+                reasons,
+                policy_version,
+                decision == ATTACHMENT_DECISION_BLOCK,
+                decision == ATTACHMENT_DECISION_QUARANTINE,
+            )
+
+        async def _ingest_message(message) -> Dict[str, Any]:
             # Build key
             gid = message.guild.id if getattr(message, "guild", None) else None
             key = ChannelKey(guild_id=gid, channel_id=message.channel.id)
 
             # Normalize content and include attachment summary/URLs.
-            content = message.content or ""
+            raw_content = message.content or ""
             attachments: List[Dict[str, Any]] = []
             safe_attachments: List[Dict[str, Any]] = []
             try:
@@ -1408,7 +1457,7 @@ class Busy38DiscordBot:
                 if attachments:
                     summary = attachment_summary_line(attachments)
                     if summary:
-                        content = (content + "\n" + summary).strip()
+                        raw_content = (raw_content + "\n" + summary).strip()
                 if self._attachment_include_urls_in_content and attachments:
                     urls = [
                         str(a.get("url"))
@@ -1416,16 +1465,27 @@ class Busy38DiscordBot:
                         if a.get("url") and (a.get("intake_decision") != "block")
                     ]
                     if urls:
-                        content = (content + "\n" + "\n".join(urls)).strip()
+                        raw_content = (raw_content + "\n" + "\n".join(urls)).strip()
             except Exception:
                 pass
+
+            orchestrator_text, intake_decision, intake_reasons, intake_policy_version, policy_blocked, _policy_quarantine = _assess_discord_text_ingress(
+                raw_content
+            )
+            transcript_text = orchestrator_text
+            if policy_blocked:
+                transcript_text = "[policy] input blocked by policy"
+                orchestrator_text = ""
+            safe_content = scrub_secrets(str(transcript_text), context="discord-bot")
+            if not safe_content and policy_blocked:
+                safe_content = "[policy] input blocked by policy"
 
             rec = MessageRecord(
                 message_id=message.id,
                 created_at_unix=message.created_at.timestamp() if getattr(message, "created_at", None) else time.time(),
                 author_id=message.author.id,
                 author_name=str(message.author),
-                content=content,
+                content=safe_content,
                 is_bot=bool(getattr(message.author, "bot", False)),
                 reply_to_id=getattr(getattr(message, "reference", None), "message_id", None),
                 attachments=safe_attachments,
@@ -1438,7 +1498,7 @@ class Busy38DiscordBot:
                 self.transcript.log_message(
                     source_id=f"discord:{message.id}",
                     timestamp=message.created_at,
-                    content=content,
+                    content=safe_content,
                     project_id=proj,
                     participants=[message.author.id],
                     topics=[],
@@ -1450,6 +1510,9 @@ class Busy38DiscordBot:
                         "author_name": str(message.author),
                         "is_bot": bool(getattr(message.author, "bot", False)),
                         "attachments": safe_attachments,
+                        "intake_decision": intake_decision,
+                        "intake_reasons": intake_reasons,
+                        "intake_policy_version": intake_policy_version,
                     },
                 )
             except Exception:
@@ -1461,7 +1524,7 @@ class Busy38DiscordBot:
                 self._sess_append_chat(
                     surface_id=surface_id,
                     role="user",
-                    text=content,
+                    text=orchestrator_text if not policy_blocked else "",
                     metadata={
                         "session_title": f"Discord {await _guild_name(getattr(message, 'guild', None)) or gid} #{await _channel_display_name(message.channel)}",
                         "guild_id": gid,
@@ -1471,10 +1534,22 @@ class Busy38DiscordBot:
                         "author_name": str(message.author),
                         "is_bot": bool(getattr(message.author, "bot", False)),
                         "attachments": safe_attachments,
+                        "intake_decision": intake_decision,
+                        "intake_reasons": intake_reasons,
+                        "intake_policy_version": intake_policy_version,
                     },
                 )
             except Exception:
                 pass
+
+            return {
+                "raw_content": raw_content,
+                "orchestrator_content": orchestrator_text,
+                "policy_blocked": policy_blocked,
+                "intake_decision": intake_decision,
+                "intake_reasons": intake_reasons,
+                "intake_policy_version": intake_policy_version,
+            }
 
         async def _is_reply_to_me(message) -> bool:
             try:
@@ -1602,11 +1677,26 @@ class Busy38DiscordBot:
                     )
                     return
 
-            # Ingest message into state + transcript (authorized DMs + all channel traffic).
-            await _ingest_message(message)
+            # Ingest message + enforce policy before invocation.
+            ingest_result = await _ingest_message(message)
+            policy_blocked = bool(ingest_result.get("policy_blocked"))
+            if policy_blocked:
+                policy_reasons = ingest_result.get("intake_reasons") or []
+                if policy_reasons:
+                    reason_text = ", ".join(str(reason) for reason in policy_reasons)
+                else:
+                    reason_text = "policy block"
+                try:
+                    await message.channel.send(f"⚠️ Input blocked by policy: {reason_text}")
+                except Exception:
+                    pass
+                return
+
+            content = str(ingest_result.get("orchestrator_content") or "")
+            if not content:
+                content = message.content or ""
             
             # Remove bot mention from message
-            content = message.content
             if is_mentioned:
                 content = content.replace(f"<@{self.bot.user.id}>", "").strip()
                 content = content.replace(f"<@!{self.bot.user.id}>", "").strip()
