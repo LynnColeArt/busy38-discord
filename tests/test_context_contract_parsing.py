@@ -99,6 +99,10 @@ def _install_minimal_core_stubs() -> None:
     sys.modules.setdefault("core.cognition", cognition_pkg)
 
     cognition_intake_pkg = types.ModuleType("core.cognition.attachment_intake")
+    cognition_intake_pkg.ATTACHMENT_DECISION_ACCEPT = "ACCEPT"
+    cognition_intake_pkg.ATTACHMENT_DECISION_BLOCK = "BLOCK"
+    cognition_intake_pkg.ATTACHMENT_DECISION_QUARANTINE = "QUARANTINE"
+    cognition_intake_pkg.assess_text_ingress = lambda *args, **kwargs: ("ACCEPT", None, None, {})
     cognition_intake_pkg.extract_attachment_text_preview = lambda *args, **kwargs: ""
     cognition_intake_pkg.make_intake_decision = lambda *args, **kwargs: ("ACCEPT", None, None, {})
     cognition_intake_pkg.sanitize_attachment_for_transcript = lambda *args, **kwargs: ""
