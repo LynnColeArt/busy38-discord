@@ -1,6 +1,6 @@
 # Discord Debug Method Enforcement Change Request
 
-Status: Approved for implementation (2026-03-05)  
+Status: Approved for implementation (2026-03-05)
 Owner: platform/ui
 
 ## Problem
