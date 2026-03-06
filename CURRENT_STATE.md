@@ -13,6 +13,8 @@ Last Updated: 2026-03-05
 ## New constraints
 
 - Plugin-local UI actions must remain fail-closed on malformed scope/settings payloads.
+- The plugin-local `debug` action is `GET`-only and must reject any other method with
+  `DISCORD_UI_METHOD_INVALID`.
 - UI actions must leave a visible local audit trail for every invocation.
 - Persisted Discord policy is non-secret configuration only and must not be used to store tokens or
   other credentials.
@@ -20,6 +22,7 @@ Last Updated: 2026-03-05
 
 ## Expected files
 
+- `docs/internal/DISCORD_DEBUG_METHOD_ENFORCEMENT_CHANGE_REQUEST.md`
 - `ui/manifest.json`
 - `ui/actions.py`
 - `toolkit/discord_policy.py`

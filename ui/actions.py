@@ -115,10 +115,29 @@ def _audit(
 
 
 def handle_debug(payload: dict | None, method: str, context: dict | None) -> dict:
-    debug_payload = _build_debug_payload(method, context)
+    normalized_method = str(method).strip().upper() or "GET"
+    if normalized_method != "GET":
+        reason_codes = ["DISCORD_UI_METHOD_INVALID"]
+        _audit(
+            action_id="debug",
+            method=normalized_method,
+            context=context,
+            payload=payload,
+            success=False,
+            mutated=False,
+            reason_codes=reason_codes,
+            error="debug action only supports GET",
+        )
+        return {
+            "success": False,
+            "message": "invalid debug method",
+            "reason_codes": reason_codes,
+        }
+
+    debug_payload = _build_debug_payload(normalized_method, context)
     _audit(
         action_id="debug",
-        method=method,
+        method=normalized_method,
         context=context,
         payload=payload,
         success=True,

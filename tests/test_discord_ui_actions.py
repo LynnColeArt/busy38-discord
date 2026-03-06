@@ -132,6 +132,28 @@ def test_handle_settings_persists_and_debug_reflects_state(tmp_path, monkeypatch
     assert policy_payload["runtime"]["anti_spam"]["max_events"] == 4
 
 
+def test_handle_debug_rejects_non_get(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))
+    actions, _policy = _load_actions()
+
+    result = actions.handle_debug(
+        {},
+        "POST",
+        {"plugin_id": "busy-38-discord", "actor": "sam", "source_path": str(ROOT)},
+    )
+
+    assert result["success"] is False
+    assert result["reason_codes"] == ["DISCORD_UI_METHOD_INVALID"]
+
+    audit_lines = (tmp_path / "audit.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    assert audit_lines
+    last_record = json.loads(audit_lines[-1])
+    assert last_record["action_id"] == "debug"
+    assert last_record["success"] is False
+    assert last_record["reason_codes"] == ["DISCORD_UI_METHOD_INVALID"]
+
+
 def test_handle_validate_returns_preview_and_reason_codes(tmp_path, monkeypatch):
     monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
     monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))

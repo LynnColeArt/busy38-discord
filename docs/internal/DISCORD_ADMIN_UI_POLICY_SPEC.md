@@ -71,6 +71,12 @@ Action handlers use the standard signature:
 
 `handle_<action>(payload: dict | None, method: str, context: dict | None) -> dict`
 
+Verb enforcement is literal:
+
+- `debug` is `GET`-only and must reject any other method with
+  `DISCORD_UI_METHOD_INVALID`,
+- rejected calls must still produce a local audit record.
+
 ## Persistence
 
 - Policy path:
@@ -94,6 +100,7 @@ Persisted policy must be JSON and contain no credentials.
 
 At minimum:
 
+- `DISCORD_UI_METHOD_INVALID`
 - `DISCORD_SCOPE_PAYLOAD_INVALID`
 - `DISCORD_SCOPE_MODE_INVALID`
 - `DISCORD_SCOPE_RULE_TARGET_INVALID`
