@@ -237,6 +237,49 @@ def test_resolve_effective_policy_disables_malformed_saved_enabled(tmp_path, mon
     assert "DISCORD_POLICY_FILE_INVALID" in resolved["reason_codes"]
 
 
+def test_handle_settings_get_round_trips_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))
+    actions, _policy = _load_actions()
+    (tmp_path / "policy.json").write_text(
+        json.dumps(
+            {
+                "enabled": False,
+                "scope": {"mode": "all", "rules": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = actions.handle_settings(
+        {},
+        "GET",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is True
+    assert result["payload"]["settings"]["enabled"] is False
+
+
+def test_handle_validate_previews_enabled_literal(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))
+    actions, _policy = _load_actions()
+
+    result = actions.handle_validate(
+        {
+            "settings": {
+                "enabled": False,
+            },
+        },
+        "POST",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is True
+    assert result["payload"]["policy_preview"]["enabled"] is False
+
+
 def test_handle_scope_fails_closed_when_audit_write_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
     audit_path = tmp_path / "audit-dir"

@@ -306,6 +306,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
             "message": "discord settings loaded",
             "payload": {
                 "settings": {
+                    "enabled": current_policy["enabled"],
                     "feature_flags": current_policy["feature_flags"],
                     "runtime": current_policy["runtime"],
                 },
@@ -439,6 +440,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
         "message": "discord settings updated",
         "payload": {
             "settings": {
+                "enabled": updated_policy["enabled"],
                 "feature_flags": updated_policy["feature_flags"],
                 "runtime": updated_policy["runtime"],
             },
@@ -487,6 +489,8 @@ def handle_validate(payload: dict | None, method: str, context: dict | None) -> 
         reason_codes.extend(settings_codes)
         errors.extend(settings_errors)
         if normalized_settings is not None and not settings_errors:
+            if "enabled" in normalized_settings:
+                preview_policy["enabled"] = normalized_settings["enabled"]
             if "feature_flags" in normalized_settings:
                 preview_policy["feature_flags"] = {
                     **preview_policy["feature_flags"],
