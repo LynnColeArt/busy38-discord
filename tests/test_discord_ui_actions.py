@@ -213,6 +213,30 @@ def test_handle_settings_rejects_non_boolean_enabled(tmp_path, monkeypatch):
     assert not (tmp_path / "policy.json").exists()
 
 
+def test_resolve_effective_policy_disables_malformed_saved_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))
+    _actions, policy = _load_actions()
+
+    (tmp_path / "policy.json").write_text(
+        json.dumps(
+            {
+                "enabled": "false",
+                "scope": {"mode": "all", "rules": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = policy.resolve_effective_policy(
+        {"plugin_id": "busy-38-discord", "actor": "sam"}
+    )
+
+    assert resolved["policy"]["enabled"] is False
+    assert "DISCORD_POLICY_ENABLED_INVALID" in resolved["reason_codes"]
+    assert "DISCORD_POLICY_FILE_INVALID" in resolved["reason_codes"]
+
+
 def test_handle_scope_fails_closed_when_audit_write_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
     audit_path = tmp_path / "audit-dir"

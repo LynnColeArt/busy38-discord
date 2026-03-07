@@ -18,6 +18,9 @@ Last Updated: 2026-03-05
 - UI actions must leave a visible local audit trail for every invocation.
 - Mutating UI actions must reject malformed non-boolean `enabled` values and
   must not report success if the audit sink cannot record the mutation.
+- Saved policy load must also validate persisted `enabled` literally:
+  - malformed saved values emit explicit invalid-policy reason codes,
+  - the affected enabled path fails closed instead of being re-enabled by truthiness.
 - Persisted Discord policy is non-secret configuration only and must not be used to store tokens or
   other credentials.
 - Admin-configured command prefixes are persisted verbatim; whitespace-only prefixes are rejected.

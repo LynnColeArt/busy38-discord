@@ -438,7 +438,17 @@ def resolve_effective_policy(context: Optional[Dict[str, Any]] = None) -> Dict[s
                 reason_codes.append("DISCORD_POLICY_FILE_INVALID")
 
     if "enabled" in saved_policy:
-        effective["enabled"] = bool(saved_policy["enabled"])
+        saved_enabled = saved_policy["enabled"]
+        if isinstance(saved_enabled, bool):
+            effective["enabled"] = saved_enabled
+        else:
+            # Fail closed for persisted policy drift: malformed saved values must
+            # not silently re-enable the plugin through Python truthiness.
+            effective["enabled"] = False
+            if "DISCORD_POLICY_ENABLED_INVALID" not in reason_codes:
+                reason_codes.append("DISCORD_POLICY_ENABLED_INVALID")
+            if "DISCORD_POLICY_FILE_INVALID" not in reason_codes:
+                reason_codes.append("DISCORD_POLICY_FILE_INVALID")
 
     unique_codes: list[str] = []
     for code in reason_codes:
