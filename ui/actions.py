@@ -120,15 +120,22 @@ def _audit_failure_response(
     message: str,
     reason_codes: list[str],
     audit_error: Optional[str],
+    extra_errors: list[str] | None = None,
 ) -> dict:
     codes = list(reason_codes)
     if "DISCORD_POLICY_AUDIT_FAILED" not in codes:
         codes.append("DISCORD_POLICY_AUDIT_FAILED")
+    errors = [str(audit_error or "unknown audit failure")]
+    for entry in extra_errors or []:
+        text = str(entry or "").strip()
+        if not text or text in errors:
+            continue
+        errors.append(text)
     return {
         "success": False,
         "message": message,
         "reason_codes": codes,
-        "errors": [str(audit_error or "unknown audit failure")],
+        "errors": errors,
     }
 
 
@@ -136,7 +143,7 @@ def handle_debug(payload: dict | None, method: str, context: dict | None) -> dic
     normalized_method = str(method).strip().upper() or "GET"
     if normalized_method != "GET":
         reason_codes = ["DISCORD_UI_METHOD_INVALID"]
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="debug",
             method=normalized_method,
             context=context,
@@ -146,6 +153,13 @@ def handle_debug(payload: dict | None, method: str, context: dict | None) -> dic
             reason_codes=reason_codes,
             error="debug action only supports GET",
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord debug audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=["debug action only supports GET"],
+            )
         return {
             "success": False,
             "message": "invalid debug method",
@@ -208,7 +222,7 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
 
     if normalized_method != "POST":
         reason_codes = ["DISCORD_SCOPE_METHOD_INVALID"]
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="scope",
             method=normalized_method,
             context=context,
@@ -219,6 +233,13 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
             before=current_policy,
             error="scope action only supports GET and POST",
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord scope audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=["scope action only supports GET and POST"],
+            )
         return {
             "success": False,
             "message": "invalid scope method",
@@ -228,7 +249,7 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
     candidate_scope = _extract_scope_payload(payload)
     normalized_scope, reason_codes, errors = validate_scope(candidate_scope)
     if errors or normalized_scope is None:
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="scope",
             method=normalized_method,
             context=context,
@@ -239,6 +260,13 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
             before=current_policy,
             error="; ".join(errors),
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord scope audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=errors,
+            )
         return {
             "success": False,
             "message": "invalid discord scope payload",
@@ -251,7 +279,7 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
     ok, persist_error = persist_policy(updated_policy, context)
     if not ok:
         reason_codes = list(reason_codes) + ["DISCORD_POLICY_PERSIST_FAILED"]
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="scope",
             method=normalized_method,
             context=context,
@@ -262,6 +290,13 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
             before=current_policy,
             error=persist_error,
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord scope audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=[str(persist_error or "unknown persistence failure")],
+            )
         return {
             "success": False,
             "message": "failed to persist discord scope policy",
@@ -351,7 +386,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
 
     if normalized_method != "POST":
         reason_codes = ["DISCORD_SETTINGS_METHOD_INVALID"]
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="settings",
             method=normalized_method,
             context=context,
@@ -362,6 +397,13 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
             before=current_policy,
             error="settings action only supports GET and POST",
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord settings audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=["settings action only supports GET and POST"],
+            )
         return {
             "success": False,
             "message": "invalid settings method",
@@ -371,7 +413,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
     candidate_settings = _extract_settings_payload(payload)
     normalized_settings, reason_codes, errors = validate_settings(candidate_settings)
     if errors or normalized_settings is None:
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="settings",
             method=normalized_method,
             context=context,
@@ -382,6 +424,13 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
             before=current_policy,
             error="; ".join(errors),
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord settings audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=errors,
+            )
         return {
             "success": False,
             "message": "invalid discord settings payload",
@@ -416,7 +465,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
     ok, persist_error = persist_policy(updated_policy, context)
     if not ok:
         reason_codes = list(reason_codes) + ["DISCORD_POLICY_PERSIST_FAILED"]
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="settings",
             method=normalized_method,
             context=context,
@@ -427,6 +476,13 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
             before=current_policy,
             error=persist_error,
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord settings audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=[str(persist_error or "unknown persistence failure")],
+            )
         return {
             "success": False,
             "message": "failed to persist discord settings",
@@ -490,7 +546,7 @@ def handle_validate(payload: dict | None, method: str, context: dict | None) -> 
     current_policy = resolved["policy"]
     if normalized_method != "POST":
         reason_codes = ["DISCORD_VALIDATE_METHOD_INVALID"]
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="validate",
             method=normalized_method,
             context=context,
@@ -501,6 +557,13 @@ def handle_validate(payload: dict | None, method: str, context: dict | None) -> 
             before=current_policy,
             error="validate action only supports POST",
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord validation audit event",
+                reason_codes=reason_codes,
+                audit_error=audit_error,
+                extra_errors=["validate action only supports POST"],
+            )
         return {
             "success": False,
             "message": "invalid validate method",

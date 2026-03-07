@@ -22,6 +22,8 @@ Last Updated: 2026-03-07
   record the invocation:
   - settings reads do not report success without an audit record,
   - validation preview does not report success without an audit record.
+- Rejected and persistence-failure admin branches also surface audit sink
+  failure explicitly instead of dropping it behind the original failure.
 - Saved policy load must also validate persisted `enabled` literally:
   - malformed saved values emit explicit invalid-policy reason codes,
   - the affected enabled path fails closed instead of being re-enabled by truthiness.

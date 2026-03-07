@@ -24,6 +24,9 @@ The scope of this repo-local implementation is:
 - UI action invocations must emit an append-only local audit record.
 - Read/preview handlers must fail visibly if the required audit append cannot be
   written; they must not report unqualified success without that audit record.
+- Rejected and other failing handler paths must also surface audit-append
+  failure explicitly; they must not silently drop missing audit records because
+  the action was already failing for another reason.
 
 ## Policy model
 
@@ -125,3 +128,5 @@ At minimum:
 - UI audit output must be produced for action invocations.
 - Read/preview actions must not report success if their required audit append
   fails.
+- Rejected invalid-method / invalid-payload paths must also surface audit
+  append failure explicitly.

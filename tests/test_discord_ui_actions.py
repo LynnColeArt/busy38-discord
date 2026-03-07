@@ -213,6 +213,30 @@ def test_handle_settings_rejects_non_boolean_enabled(tmp_path, monkeypatch):
     assert not (tmp_path / "policy.json").exists()
 
 
+def test_handle_settings_invalid_payload_surfaces_audit_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    actions, _policy = _load_actions()
+    audit_dir = tmp_path / "audit-dir"
+    audit_dir.mkdir()
+
+    result = actions.handle_settings(
+        {
+            "enabled": "false",
+        },
+        "POST",
+        {
+            "plugin_id": "busy-38-discord",
+            "actor": "sam",
+            "audit_path": str(audit_dir),
+        },
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_SETTINGS_VALUE_INVALID" in result["reason_codes"]
+    assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
+    assert "enabled must be boolean" in result["errors"]
+
+
 def test_resolve_effective_policy_disables_malformed_saved_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
     monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))
@@ -235,6 +259,27 @@ def test_resolve_effective_policy_disables_malformed_saved_enabled(tmp_path, mon
     assert resolved["policy"]["enabled"] is False
     assert "DISCORD_POLICY_ENABLED_INVALID" in resolved["reason_codes"]
     assert "DISCORD_POLICY_FILE_INVALID" in resolved["reason_codes"]
+
+
+def test_handle_validate_invalid_method_surfaces_audit_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    actions, _policy = _load_actions()
+    audit_dir = tmp_path / "audit-dir"
+    audit_dir.mkdir()
+
+    result = actions.handle_validate(
+        {},
+        "GET",
+        {
+            "plugin_id": "busy-38-discord",
+            "actor": "sam",
+            "audit_path": str(audit_dir),
+        },
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_VALIDATE_METHOD_INVALID" in result["reason_codes"]
+    assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
 
 
 def test_handle_settings_get_round_trips_enabled(tmp_path, monkeypatch):
