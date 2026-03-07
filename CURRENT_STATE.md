@@ -1,6 +1,6 @@
 # busy38-discord Current State
 
-Last Updated: 2026-03-05
+Last Updated: 2026-03-07
 
 ## Current behavior
 
@@ -18,6 +18,10 @@ Last Updated: 2026-03-05
 - UI actions must leave a visible local audit trail for every invocation.
 - Mutating UI actions must reject malformed non-boolean `enabled` values and
   must not report success if the audit sink cannot record the mutation.
+- Read/preview admin actions must also fail visibly if the audit sink cannot
+  record the invocation:
+  - settings reads do not report success without an audit record,
+  - validation preview does not report success without an audit record.
 - Saved policy load must also validate persisted `enabled` literally:
   - malformed saved values emit explicit invalid-policy reason codes,
   - the affected enabled path fails closed instead of being re-enabled by truthiness.

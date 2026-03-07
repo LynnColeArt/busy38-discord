@@ -330,3 +330,43 @@ def test_handle_settings_fails_closed_when_audit_write_fails(tmp_path, monkeypat
     assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
     after = json.loads(policy_path.read_text(encoding="utf-8"))
     assert after == before
+
+
+def test_handle_settings_get_fails_closed_when_audit_write_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    audit_path = tmp_path / "audit-dir"
+    audit_path.mkdir()
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(audit_path))
+    actions, _policy = _load_actions()
+
+    result = actions.handle_settings(
+        {},
+        "GET",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
+    assert "failed to record discord settings audit event" == result["message"]
+
+
+def test_handle_validate_fails_closed_when_audit_write_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    audit_path = tmp_path / "audit-dir"
+    audit_path.mkdir()
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(audit_path))
+    actions, _policy = _load_actions()
+
+    result = actions.handle_validate(
+        {
+            "settings": {
+                "enabled": False,
+            },
+        },
+        "POST",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
+    assert "failed to record discord validation audit event" == result["message"]

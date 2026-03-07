@@ -115,6 +115,23 @@ def _audit(
     )
 
 
+def _audit_failure_response(
+    *,
+    message: str,
+    reason_codes: list[str],
+    audit_error: Optional[str],
+) -> dict:
+    codes = list(reason_codes)
+    if "DISCORD_POLICY_AUDIT_FAILED" not in codes:
+        codes.append("DISCORD_POLICY_AUDIT_FAILED")
+    return {
+        "success": False,
+        "message": message,
+        "reason_codes": codes,
+        "errors": [str(audit_error or "unknown audit failure")],
+    }
+
+
 def handle_debug(payload: dict | None, method: str, context: dict | None) -> dict:
     normalized_method = str(method).strip().upper() or "GET"
     if normalized_method != "GET":
@@ -136,7 +153,7 @@ def handle_debug(payload: dict | None, method: str, context: dict | None) -> dic
         }
 
     debug_payload = _build_debug_payload(normalized_method, context)
-    _audit(
+    audit_ok, audit_error = _audit(
         action_id="debug",
         method=normalized_method,
         context=context,
@@ -145,6 +162,12 @@ def handle_debug(payload: dict | None, method: str, context: dict | None) -> dic
         mutated=False,
         reason_codes=list(debug_payload.get("reason_codes") or []),
     )
+    if not audit_ok:
+        return _audit_failure_response(
+            message="failed to record discord debug audit event",
+            reason_codes=list(debug_payload.get("reason_codes") or []),
+            audit_error=audit_error,
+        )
     return {
         "success": True,
         "message": "plugin ui debug handler executed",
@@ -159,7 +182,7 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
     current_policy = resolved["policy"]
     current_scope = current_policy["scope"]
     if normalized_method == "GET":
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="scope",
             method=normalized_method,
             context=context,
@@ -168,6 +191,12 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
             mutated=False,
             reason_codes=list(resolved["reason_codes"] or []),
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord scope audit event",
+                reason_codes=list(resolved["reason_codes"] or []),
+                audit_error=audit_error,
+            )
         return {
             "success": True,
             "message": "discord scope policy loaded",
@@ -292,7 +321,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
     saved_policy, _saved_policy_codes = load_saved_policy(context)
     current_policy = resolved["policy"]
     if normalized_method == "GET":
-        _audit(
+        audit_ok, audit_error = _audit(
             action_id="settings",
             method=normalized_method,
             context=context,
@@ -301,6 +330,12 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
             mutated=False,
             reason_codes=list(resolved["reason_codes"] or []),
         )
+        if not audit_ok:
+            return _audit_failure_response(
+                message="failed to record discord settings audit event",
+                reason_codes=list(resolved["reason_codes"] or []),
+                audit_error=audit_error,
+            )
         return {
             "success": True,
             "message": "discord settings loaded",
@@ -513,7 +548,7 @@ def handle_validate(payload: dict | None, method: str, context: dict | None) -> 
                     }
 
     success = not errors
-    _audit(
+    audit_ok, audit_error = _audit(
         action_id="validate",
         method=normalized_method,
         context=context,
@@ -525,6 +560,12 @@ def handle_validate(payload: dict | None, method: str, context: dict | None) -> 
         after=preview_policy if success else None,
         error="; ".join(errors) if errors else None,
     )
+    if not audit_ok:
+        return _audit_failure_response(
+            message="failed to record discord validation audit event",
+            reason_codes=reason_codes,
+            audit_error=audit_error,
+        )
     return {
         "success": success,
         "message": "discord policy validation complete" if success else "discord policy validation failed",

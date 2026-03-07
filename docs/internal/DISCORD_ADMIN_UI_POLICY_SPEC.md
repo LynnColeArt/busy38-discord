@@ -22,6 +22,8 @@ The scope of this repo-local implementation is:
 - Plugin-local handlers validate payloads and persist non-secret policy only.
 - Invalid scope or settings payloads must fail closed with explicit reason codes.
 - UI action invocations must emit an append-only local audit record.
+- Read/preview handlers must fail visibly if the required audit append cannot be
+  written; they must not report unqualified success without that audit record.
 
 ## Policy model
 
@@ -113,6 +115,7 @@ At minimum:
 - `DISCORD_SETTINGS_VALUE_INVALID`
 - `DISCORD_POLICY_FILE_INVALID`
 - `DISCORD_POLICY_PERSIST_FAILED`
+- `DISCORD_POLICY_AUDIT_FAILED`
 
 ## Validation requirements
 
@@ -120,3 +123,5 @@ At minimum:
 - Invalid scope/settings payloads must return deterministic reason codes.
 - Successful writes must be visible in subsequent debug reads.
 - UI audit output must be produced for action invocations.
+- Read/preview actions must not report success if their required audit append
+  fails.
