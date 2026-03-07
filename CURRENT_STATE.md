@@ -16,6 +16,8 @@ Last Updated: 2026-03-05
 - The plugin-local `debug` action is `GET`-only and must reject any other method with
   `DISCORD_UI_METHOD_INVALID`.
 - UI actions must leave a visible local audit trail for every invocation.
+- Mutating UI actions must reject malformed non-boolean `enabled` values and
+  must not report success if the audit sink cannot record the mutation.
 - Persisted Discord policy is non-secret configuration only and must not be used to store tokens or
   other credentials.
 - Admin-configured command prefixes are persisted verbatim; whitespace-only prefixes are rejected.

@@ -254,6 +254,13 @@ def validate_settings(settings: Any) -> tuple[Optional[Dict[str, Any]], list[str
     errors: list[str] = []
     normalized: Dict[str, Any] = {}
 
+    if "enabled" in settings:
+        enabled = settings["enabled"]
+        if not isinstance(enabled, bool):
+            errors.append("enabled must be boolean")
+        else:
+            normalized["enabled"] = bool(enabled)
+
     feature_flags = settings.get("feature_flags")
     if feature_flags is not None:
         if not isinstance(feature_flags, dict):

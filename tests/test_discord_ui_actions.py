@@ -192,3 +192,74 @@ def test_handle_settings_rejects_whitespace_only_command_prefix(tmp_path, monkey
     assert result["success"] is False
     assert "DISCORD_SETTINGS_VALUE_INVALID" in result["reason_codes"]
     assert "runtime.command_prefix must be a non-empty string" in result["errors"]
+
+
+def test_handle_settings_rejects_non_boolean_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))
+    actions, _policy = _load_actions()
+
+    result = actions.handle_settings(
+        {
+            "enabled": "false",
+        },
+        "POST",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_SETTINGS_VALUE_INVALID" in result["reason_codes"]
+    assert "enabled must be boolean" in result["errors"]
+    assert not (tmp_path / "policy.json").exists()
+
+
+def test_handle_scope_fails_closed_when_audit_write_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
+    audit_path = tmp_path / "audit-dir"
+    audit_path.mkdir()
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(audit_path))
+    actions, _policy = _load_actions()
+
+    result = actions.handle_scope(
+        {"mode": "all", "rules": []},
+        "POST",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
+    assert not (tmp_path / "policy.json").exists()
+
+
+def test_handle_settings_fails_closed_when_audit_write_fails(tmp_path, monkeypatch):
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "scope": {"mode": "all", "effective_source": "saved", "rules": []},
+                "feature_flags": {"status_narration_enabled": False},
+                "runtime": {"command_prefix": "!busy38 "},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(policy_path))
+    audit_path = tmp_path / "audit-dir"
+    audit_path.mkdir()
+    monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(audit_path))
+    actions, _policy = _load_actions()
+
+    before = json.loads(policy_path.read_text(encoding="utf-8"))
+    result = actions.handle_settings(
+        {
+            "enabled": False,
+        },
+        "POST",
+        {"plugin_id": "busy-38-discord", "actor": "sam"},
+    )
+
+    assert result["success"] is False
+    assert "DISCORD_POLICY_AUDIT_FAILED" in result["reason_codes"]
+    after = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert after == before

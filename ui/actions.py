@@ -26,6 +26,7 @@ evaluate_scope = _POLICY_MODULE.evaluate_scope
 persist_policy = _POLICY_MODULE.persist_policy
 policy_path = _POLICY_MODULE.policy_path
 resolve_effective_policy = _POLICY_MODULE.resolve_effective_policy
+load_saved_policy = _POLICY_MODULE.load_saved_policy
 validate_scope = _POLICY_MODULE.validate_scope
 validate_settings = _POLICY_MODULE.validate_settings
 
@@ -99,8 +100,8 @@ def _audit(
     before: Optional[dict] = None,
     after: Optional[dict] = None,
     error: Optional[str] = None,
-) -> None:
-    append_ui_audit_event(
+) -> tuple[bool, Optional[str]]:
+    return append_ui_audit_event(
         action_id=action_id,
         method=method,
         context=context,
@@ -154,6 +155,7 @@ def handle_debug(payload: dict | None, method: str, context: dict | None) -> dic
 def handle_scope(payload: dict | None, method: str, context: dict | None) -> dict:
     normalized_method = str(method).strip().upper() or "GET"
     resolved = resolve_effective_policy(context)
+    saved_policy, _saved_policy_codes = load_saved_policy(context)
     current_policy = resolved["policy"]
     current_scope = current_policy["scope"]
     if normalized_method == "GET":
@@ -238,7 +240,7 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
             "errors": [str(persist_error or "unknown persistence failure")],
         }
 
-    _audit(
+    audit_ok, audit_error = _audit(
         action_id="scope",
         method=normalized_method,
         context=context,
@@ -249,6 +251,31 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
         before=current_policy,
         after=updated_policy,
     )
+    if not audit_ok:
+        reason_codes = list(reason_codes) + ["DISCORD_POLICY_AUDIT_FAILED"]
+        rollback_ok = True
+        rollback_error: Optional[str] = None
+        if isinstance(saved_policy, dict):
+            rollback_ok, rollback_error = persist_policy(saved_policy, context)
+        else:
+            persisted_path = policy_path(context)
+            try:
+                if persisted_path.exists():
+                    persisted_path.unlink()
+            except Exception as exc:
+                rollback_ok = False
+                rollback_error = str(exc)
+        if not rollback_ok:
+            reason_codes.append("DISCORD_POLICY_ROLLBACK_FAILED")
+        errors = [str(audit_error or "unknown audit failure")]
+        if rollback_error:
+            errors.append(f"rollback failed: {rollback_error}")
+        return {
+            "success": False,
+            "message": "failed to record discord scope policy audit event",
+            "reason_codes": reason_codes,
+            "errors": errors,
+        }
     return {
         "success": True,
         "message": "discord scope policy updated",
@@ -262,6 +289,7 @@ def handle_scope(payload: dict | None, method: str, context: dict | None) -> dic
 def handle_settings(payload: dict | None, method: str, context: dict | None) -> dict:
     normalized_method = str(method).strip().upper() or "GET"
     resolved = resolve_effective_policy(context)
+    saved_policy, _saved_policy_codes = load_saved_policy(context)
     current_policy = resolved["policy"]
     if normalized_method == "GET":
         _audit(
@@ -326,8 +354,8 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
         }
 
     updated_policy = dict(current_policy)
-    if "enabled" in (candidate_settings or {}):
-        updated_policy["enabled"] = bool((candidate_settings or {})["enabled"])
+    if "enabled" in normalized_settings:
+        updated_policy["enabled"] = normalized_settings["enabled"]
     if "feature_flags" in normalized_settings:
         updated_policy["feature_flags"] = {
             **current_policy["feature_flags"],
@@ -370,7 +398,7 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
             "errors": [str(persist_error or "unknown persistence failure")],
         }
 
-    _audit(
+    audit_ok, audit_error = _audit(
         action_id="settings",
         method=normalized_method,
         context=context,
@@ -381,6 +409,31 @@ def handle_settings(payload: dict | None, method: str, context: dict | None) -> 
         before=current_policy,
         after=updated_policy,
     )
+    if not audit_ok:
+        reason_codes = list(reason_codes) + ["DISCORD_POLICY_AUDIT_FAILED"]
+        rollback_ok = True
+        rollback_error: Optional[str] = None
+        if isinstance(saved_policy, dict):
+            rollback_ok, rollback_error = persist_policy(saved_policy, context)
+        else:
+            persisted_path = policy_path(context)
+            try:
+                if persisted_path.exists():
+                    persisted_path.unlink()
+            except Exception as exc:
+                rollback_ok = False
+                rollback_error = str(exc)
+        if not rollback_ok:
+            reason_codes.append("DISCORD_POLICY_ROLLBACK_FAILED")
+        errors = [str(audit_error or "unknown audit failure")]
+        if rollback_error:
+            errors.append(f"rollback failed: {rollback_error}")
+        return {
+            "success": False,
+            "message": "failed to record discord settings audit event",
+            "reason_codes": reason_codes,
+            "errors": errors,
+        }
     return {
         "success": True,
         "message": "discord settings updated",
