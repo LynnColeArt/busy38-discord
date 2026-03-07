@@ -237,6 +237,44 @@ def test_handle_settings_invalid_payload_surfaces_audit_failure(tmp_path, monkey
     assert "enabled must be boolean" in result["errors"]
 
 
+def test_default_policy_env_booleans_preserve_declared_defaults_when_malformed(monkeypatch):
+    _actions, policy = _load_actions()
+    monkeypatch.setenv("DISCORD_STATUS_ENABLE", "flase")
+    monkeypatch.setenv("DISCORD_NO_RESPONSE_REACTIONS", "fasle")
+    monkeypatch.setenv("DISCORD_ATTACHMENT_INCLUDE_URLS", "definitely")
+    monkeypatch.setenv("DISCORD_AUTO_CLEAR_ENABLE", "not-a-bool")
+
+    resolved = policy.default_policy()
+    flags = resolved["feature_flags"]
+
+    assert flags["status_narration_enabled"] is False
+    assert flags["no_response_reaction_enabled"] is True
+    assert flags["respond_with_reaction"] is True
+    assert flags["attachments"]["include_urls"] is True
+    assert flags["auto_clear_enabled"] is False
+
+
+def test_default_policy_env_booleans_accept_literal_values(monkeypatch):
+    _actions, policy = _load_actions()
+    monkeypatch.setenv("DISCORD_STATUS_ENABLE", "true")
+    monkeypatch.setenv("DISCORD_NO_RESPONSE_REACTIONS", "off")
+    monkeypatch.setenv("DISCORD_ATTACHMENT_INCLUDE_URLS", "0")
+    monkeypatch.setenv("DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE", "0")
+    monkeypatch.setenv("DISCORD_AUTO_CLEAR_ENABLE", "yes")
+    monkeypatch.setenv("DISCORD_CONTEXT_SUMMARY_ENABLE", "no")
+
+    resolved = policy.default_policy()
+    flags = resolved["feature_flags"]
+
+    assert flags["status_narration_enabled"] is True
+    assert flags["no_response_reaction_enabled"] is False
+    assert flags["respond_with_reaction"] is False
+    assert flags["attachments"]["include_urls"] is False
+    assert flags["attachments"]["text_preview_enabled"] is False
+    assert flags["auto_clear_enabled"] is True
+    assert flags["context_summary_enabled"] is False
+
+
 def test_resolve_effective_policy_disables_malformed_saved_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("BUSY38_DISCORD_POLICY_PATH", str(tmp_path / "policy.json"))
     monkeypatch.setenv("BUSY38_DISCORD_UI_AUDIT_PATH", str(tmp_path / "audit.ndjson"))

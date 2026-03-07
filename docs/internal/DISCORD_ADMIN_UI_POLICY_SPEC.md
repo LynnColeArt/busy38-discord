@@ -37,6 +37,12 @@ Persist a plugin-local `discord_policy` document with three top-level sections:
 3. `feature_flags`
 4. `runtime`
 
+Env-default feature-flag booleans must parse literally:
+
+- valid explicit boolean env forms may override the declared default,
+- malformed env values must fall back to the declared default,
+- malformed non-empty env strings must not enable a feature by truthiness.
+
 ### Scope
 
 `scope.mode` must be one of:

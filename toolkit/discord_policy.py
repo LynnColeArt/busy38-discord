@@ -23,9 +23,27 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _truthy_env(name: str, default: str) -> bool:
-    raw = str(os.getenv(name, default) or "").strip().lower()
-    return raw not in {"", "0", "false", "no", "off"}
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_FALSE_ENV_VALUES = {"0", "false", "no", "off", ""}
+
+
+def _parse_bool_literal(raw: Any) -> Optional[bool]:
+    candidate = str(raw or "").strip().lower()
+    if candidate in _TRUE_ENV_VALUES:
+        return True
+    if candidate in _FALSE_ENV_VALUES:
+        return False
+    return None
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    parsed = _parse_bool_literal(raw)
+    if parsed is None:
+        return bool(default)
+    return parsed
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -93,19 +111,19 @@ def default_policy() -> Dict[str, Any]:
             "rules": [],
         },
         "feature_flags": {
-            "auto_clear_enabled": _truthy_env("DISCORD_AUTO_CLEAR_ENABLE", "0"),
+            "auto_clear_enabled": _bool_env("DISCORD_AUTO_CLEAR_ENABLE", False),
             "auto_clear_min_gap_sec": _int_env("DISCORD_AUTO_CLEAR_MIN_GAP_SEC", 21600, minimum=60),
-            "context_summary_enabled": _truthy_env("DISCORD_CONTEXT_SUMMARY_ENABLE", "0"),
+            "context_summary_enabled": _bool_env("DISCORD_CONTEXT_SUMMARY_ENABLE", False),
             "context_summary_interval_sec": _int_env("DISCORD_CONTEXT_SUMMARY_INTERVAL_SEC", 3600, minimum=60),
-            "no_response_reaction_enabled": _truthy_env("DISCORD_NO_RESPONSE_REACTIONS", "1"),
+            "no_response_reaction_enabled": _bool_env("DISCORD_NO_RESPONSE_REACTIONS", True),
             "no_response_reaction_palette": _string_list_env("DISCORD_NO_RESPONSE_EMOJIS", "👍,👀,✅"),
-            "status_narration_enabled": _truthy_env("DISCORD_STATUS_ENABLE", "0"),
+            "status_narration_enabled": _bool_env("DISCORD_STATUS_ENABLE", False),
             "status_narration_mode": _string_env("DISCORD_STATUS_MODE", "edit").lower(),
-            "respond_with_reaction": _truthy_env("DISCORD_NO_RESPONSE_REACTIONS", "1"),
+            "respond_with_reaction": _bool_env("DISCORD_NO_RESPONSE_REACTIONS", True),
             "allowlist_admin_users_only": False,
             "attachments": {
-                "include_urls": _truthy_env("DISCORD_ATTACHMENT_INCLUDE_URLS", "1"),
-                "text_preview_enabled": _truthy_env("DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE", "1"),
+                "include_urls": _bool_env("DISCORD_ATTACHMENT_INCLUDE_URLS", True),
+                "text_preview_enabled": _bool_env("DISCORD_ATTACHMENT_TEXT_PREVIEW_ENABLE", True),
                 "text_preview_max_bytes": _int_env("DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES", 65536, minimum=1),
                 "text_preview_max_chars": _int_env("DISCORD_ATTACHMENT_TEXT_PREVIEW_MAX_CHARS", 1200, minimum=80),
             },

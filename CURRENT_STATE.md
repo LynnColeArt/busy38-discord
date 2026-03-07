@@ -27,6 +27,10 @@ Last Updated: 2026-03-07
 - Saved policy load must also validate persisted `enabled` literally:
   - malformed saved values emit explicit invalid-policy reason codes,
   - the affected enabled path fails closed instead of being re-enabled by truthiness.
+- Env-default Discord feature-flag booleans must also parse literally:
+  - valid explicit env boolean forms override the declared default,
+  - malformed env values fall back to the declared default,
+  - malformed non-empty env strings must not enable a feature by truthiness.
 - The settings/validate UI contract now round-trips `enabled` literally:
   - `GET /ui/settings` returns the effective persisted `enabled` value,
   - validation preview reflects candidate `enabled` changes instead of hiding
